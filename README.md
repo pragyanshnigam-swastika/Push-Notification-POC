@@ -58,6 +58,11 @@ $payload | docker exec -i $container redis-cli -x XADD notification_requests '*'
 The Redis field must be named `payload`; its value is the JSON request. For a
 strict 1:1 workflow, publish exactly one device token in each entry.
 
+## Deployment
+
+- [Free POC deployment (Render + Upstash)](docs/free-poc-deployment.md) — no credit card, no AWS account.
+- [EC2 + systemd deployment](docs/ec2-systemd-deployment.md) — for a production-bound deployment.
+
 ## API Endpoints
 
 - `POST /notify`
