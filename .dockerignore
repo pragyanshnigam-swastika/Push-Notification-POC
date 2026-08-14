@@ -1,0 +1,8 @@
+.git
+docs
+tests
+*.md
+src/.env
+src/.env.*
+!src/.env.example
+src/service-account.json
