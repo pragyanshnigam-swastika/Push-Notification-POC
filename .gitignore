@@ -1,0 +1,19 @@
+# Go build and test artifacts
+bin/
+dist/
+*.exe
+*.out
+*.test
+
+# Local runtime secrets and credentials
+.env
+.env.*
+!.env.example
+service-account.json
+*.json
+
+# OS/editor noise
+.DS_Store
+.vscode/
+*.log
+

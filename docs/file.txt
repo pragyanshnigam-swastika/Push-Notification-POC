@@ -1,0 +1,24 @@
+1. Run docker | `docker run --rm -p 6379:6379 redis:7-alpine`
+2. Consumer | `go run .`
+3. Push single payload into Redis | `'{"deviceTokens":["cNu5_KFrRDmAHpTqKvBMtF:APA91bG4ZtMBNI4B7tFMM7c97_FIXcByfJnMywxNRASrElLZk67Bi1qoa25wU14gxn_3tiqrgcuIp7KM3TWTBtgM1fMdHbr-cKDuIAlyxvjvA1wD7tEGDNQ"],"title":"Price alert","message":"Your order was filled"}' | docker exec -i 46b70f7ca0d1 redis-cli -x XADD notification_requests '*' payload`
+
+4. Push multiple payloads into Redis
+$container = "cf61327ddaf4"
+$token = "cNu5_KFrRDmAHpTqKvBMtF:APA91bG4ZtMBNI4B7tFMM7c97_FIXcByfJnMywxNRASrElLZk67Bi1qoa25wU14gxn_3tiqrgcuIp7KM3TWTBtgM1fMdHbr-cKDuIAlyxvjvA1wD7tEGDNQ"
+
+1..2 | ForEach-Object {
+    $payload = @{
+        deviceTokens = @($token)
+        title        = "Load test #$_"
+        message      = "High-priority test notification #$_"
+    } | ConvertTo-Json -Compress
+
+    $payload | docker exec -i $container redis-cli -x XADD notification_requests '*' payload | Out-Null
+}
+
+5. Run Redis CLI | `docker exec -it <CONTAINER_NAME> redis-cli`
+
+REDIS_STREAM=notification_requests
+REDIS_GROUP=push-delivery
+
+Cancellation token required to shut down server or else force exit
