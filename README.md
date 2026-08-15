@@ -61,7 +61,9 @@ strict 1:1 workflow, publish exactly one device token in each entry.
 ## Deployment
 
 - [Free POC deployment (Render + Upstash)](docs/free-poc-deployment.md) — no credit card, no AWS account.
-- [EC2 + systemd deployment](docs/ec2-systemd-deployment.md) — for a production-bound deployment.
+- [POC deployment deep dive](docs/poc-deployment-explained.md) — architecture, runtime lifecycle, cost, and testing for the live Render + Upstash deployment.
+- [EC2 + systemd deployment](docs/ec2-systemd-deployment.md) — base steps for a production-bound deployment.
+- [Production deployment guide](docs/production-deployment-guide.md) — recommended production architecture, cost estimate, security, and migration checklist.
 
 ## API Endpoints
 
