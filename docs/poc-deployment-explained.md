@@ -9,8 +9,8 @@ service somewhere for free."
 Companion documents:
 - [free-poc-deployment.md](./free-poc-deployment.md) — the step-by-step
   "how to click through it" setup guide.
-- [production-deployment-guide.md](./production-deployment-guide.md) — what
-  changes for a real production deployment.
+- [production-deployment-explained.md](./production-deployment-explained.md)
+  — what changes for a real production deployment.
 
 ---
 
@@ -20,22 +20,22 @@ The service (a Go HTTP + Redis-consumer app that sends Firebase Cloud
 Messaging pushes) is deployed as:
 
 - **Compute:** [Render](https://render.com) — a Platform-as-a-Service (PaaS)
-  that builds the Go binary from GitHub and runs it as a **free, scale-to-zero
-  web service**.
+  that builds the repo's `Dockerfile` into a container image and runs it as
+  a **free, scale-to-zero web service**.
 - **Queue/cache:** [Upstash](https://upstash.com) — a **serverless, managed
   Redis** database, used on its **free tier**.
 
 **Cost: $0/month**, with no credit card on file for either service, as long
 as usage stays POC-shaped (occasional demos, not 24/7 traffic — details in
-§7 and §8).
+§10 and §11).
 
 **The one sentence a stakeholder needs:** this deployment proves the code
 works end-to-end on the public internet for free, but it deliberately trades
 away 24/7 availability and consumer responsiveness to get that $0 price —
 which is exactly the right trade for a demo, and exactly the wrong trade for
-production. §9 in this document and all of
-[production-deployment-guide.md](./production-deployment-guide.md) covers
-what changes.
+production. §12 in this document and all of
+[production-deployment-explained.md](./production-deployment-explained.md)
+covers what changes.
 
 ---
 
@@ -48,7 +48,7 @@ flowchart LR
         Upstream[Upstream service<br/>publishing urgent pushes]
     end
 
-    subgraph Render["Render (free Web Service)"]
+    subgraph Render["Render (free Web Service, Docker build)"]
         App[Go binary<br/>HTTP server + Redis consumer<br/>goroutines in ONE process]
     end
 
@@ -76,12 +76,69 @@ Two independent things live inside the **single Go process** Render runs:
    `consumeLoop` and `reclaimLoop`, started once at process startup and
    running for the entire lifetime of the process.
 
-This matters a lot for §7 below: there is no separate "worker" process. The
+This matters a lot for §9 below: there is no separate "worker" process. The
 consumer's uptime is 100% tied to whether the HTTP process is alive.
+
+### How it works, step by step
+
+1. A developer pushes code to the branch Render is watching, on GitHub.
+2. Render detects the push and builds the repo's `Dockerfile` (§7) into a
+   fresh container image, then rolls the running service over to it.
+3. The new container starts: `main()` runs, loads the Firebase credential,
+   connects to Upstash Redis, creates the consumer group if it doesn't exist
+   yet, and starts the `consumeLoop`/`reclaimLoop` goroutines alongside the
+   HTTP server — all in the same process, at the same moment.
+4. From here on, two independent request paths run side by side:
+   - A **client calls the HTTP API directly** (`POST /notify` or
+     `/topics/*`) → handled synchronously; a response is returned
+     immediately.
+   - An **upstream service `XADD`s an entry into the Redis stream** → the
+     consumer picks it up on its next poll, calls FCM, and either
+     acknowledges the entry (success, or a permanent failure) or leaves it
+     pending for `XAUTOCLAIM` to retry later (a temporary failure).
+5. Both paths end the same way: an authenticated HTTPS POST to FCM's
+   `messages:send` endpoint (or the IID `batchAdd`/`batchRemove` endpoints
+   for topic management), using a bearer token derived from the Firebase
+   service-account credential via OAuth2.
 
 ---
 
-## 3. Why Render and why Upstash
+## 3. Purpose of every component, explicitly
+
+Before anything else, here is exactly what each moving part is *for* — the
+one-line job each one does, so there's no ambiguity about why it's in the
+picture:
+
+- **Render's purpose:** run the compiled Go binary as an internet-reachable
+  service (while awake). It provides compute, a public HTTPS URL with a TLS
+  certificate, and the automation that turns a `git push` into a running
+  deployment. Nothing about Render is specific to this app's business
+  logic — it is purely "where the process lives and how the outside world
+  reaches it."
+- **Upstash's purpose:** host the Redis Stream (`notification_requests`)
+  that the 1:1 delivery path reads from. It is the durable "inbox" an
+  upstream service drops urgent push requests into, plus the coordination
+  primitives (consumer groups, `XAUTOCLAIM`) that make retries and
+  crash-recovery possible. The app's HTTP endpoints (`/notify`,
+  `/topics/*`) never touch Upstash at all — Redis is exclusively the
+  high-priority intake lane, not general-purpose storage.
+- **Docker's purpose (the `Dockerfile`/`.dockerignore`):** describe, as
+  code, exactly how to turn the Go source into a runnable container image,
+  so the same build produces an identical artifact wherever a container
+  runtime exists — Render today, potentially ECS, Kubernetes, or a laptop
+  tomorrow. Full explanation in §7.
+- **GitHub's purpose:** the source of truth for the code, and the trigger
+  for deployment. Render watches a branch; every push to it is what causes
+  a new Docker image to be built and rolled out.
+- **Firebase Cloud Messaging (FCM) / Instance ID (IID) APIs' purpose:** the
+  actual delivery network. Everything else in this stack exists only to get
+  a well-formed, authenticated HTTPS request to these two Google-operated
+  APIs at the right time — this deployment doesn't host or control them at
+  all.
+
+---
+
+## 4. Why Render and why Upstash
 
 ### The original plan, and why it changed
 
@@ -98,14 +155,14 @@ genuinely free, no card.
 | Requirement | How Render meets it |
 |---|---|
 | Free, no credit card | Free Web Service tier: 750 shared compute-hours/month, no card required to sign up or deploy |
-| Builds Go from source | Native Go buildpack (detects `go.mod`, runs a build + start command) — no Dockerfile needed, though one is available in the repo if preferred |
+| Builds the app reproducibly | Builds the repo's `Dockerfile` into a container image — a fixed Go toolchain version and OS baseline every time, rather than depending on whatever build environment a language-specific buildpack happens to provide |
 | Public HTTPS endpoint | Every web service gets a `*.onrender.com` URL with TLS automatically |
-| Git-based deploys | Auto-deploys on push to the connected branch (what triggered the PR #1 build) |
+| Git-based deploys | Auto-deploys on every push to the connected branch — no manual build/upload step |
 | Logs/metrics | Built-in log viewer and basic metrics, no extra setup |
 
 The cost of "free" here is that Render **scales the instance to zero after 15
 minutes with no inbound HTTP traffic** and cold-starts it on the next
-request (30–60 seconds). That's covered in depth in §7.
+request (30–60 seconds). That's covered in depth in §9.
 
 ### Why Upstash (Redis)
 
@@ -128,46 +185,37 @@ design, not by coincidence.
 
 | Option | Why not, for a POC |
 |---|---|
-| AWS EC2 + ElastiCache (`docs/ec2-systemd-deployment.md`) | Real money from hour one (~$18–25/month minimum), requires a VPC, security groups, an AWS account — overkill to *prove the code works* |
+| AWS EC2 + ElastiCache ([production-deployment-explained.md](./production-deployment-explained.md)) | Real money from hour one (~$18–25/month minimum), requires a VPC, security groups, an AWS account — overkill to *prove the code works* |
 | Fly.io + Upstash | Fly.io no longer has an indefinite free tier (see above) |
 | Local-only (`go run .`) | Not reachable from the internet — can't be demoed to anyone outside your machine |
 
 ---
 
-## 4. What Render actually is, precisely
+## 5. What Render actually is, precisely
 
-Render is a **Platform-as-a-Service**: you point it at a Git repo, it builds
-your app using a detected or specified runtime, and it runs the result as a
-managed, internet-facing service. You don't provision servers, configure a
-reverse proxy, manage TLS certificates, or write a systemd unit — Render does
-all of that.
+Render is a **Platform-as-a-Service**: point it at a Git repo, and it builds
+and runs the result as a managed, internet-facing service — no manual server
+provisioning, reverse proxy configuration, or TLS certificate management.
 
-For this deployment specifically, Render is configured as:
+For this deployment specifically, Render runs the **Docker route**:
 
-- **Runtime:** native Go buildpack (not the Docker route, even though a
-  `Dockerfile`/`.dockerignore` exist in the repo root — Render's repo scan
-  happened before those files were pushed, so it defaulted to Go).
-- **Root Directory:** `src` — this is where `go.mod` lives, and Render runs
-  its build/start commands from this directory.
-- **Build Command:** `go build -tags netgo -ldflags '-s -w' -o app`
-  - `-tags netgo` forces the pure-Go DNS resolver (avoids needing a C
-    toolchain/cgo in the build image).
-  - `-ldflags '-s -w'` strips debug symbols, producing a smaller binary.
-- **Start Command:** `./app`
+- **Runtime:** Docker. Render builds the repository's root `Dockerfile`
+  directly — the multi-stage build described in §7 — rather than using a
+  language-specific buildpack.
+- **Dockerfile path / build context:** the default (`./Dockerfile`, repo
+  root as the build context), which matches how the Dockerfile's
+  `COPY src/...` instructions expect to find the source.
+- **Start command:** none set — the container runs whatever the image's own
+  `ENTRYPOINT` specifies (`/push-service`, the compiled binary).
 - **Instance:** Free plan — 512 MB RAM, 0.1 shared vCPU.
 - **Region:** Oregon (US West) by default on the free tier.
 
-Because `go.mod` declares `go 1.26.5`, and Go's toolchain manager
-auto-downloads the exact matching Go release when it isn't already
-installed, Render's build environment fetches Go 1.26.5 on demand from
-`proxy.golang.org` during the build — no manual version pinning needed.
-
-Every git push to the connected branch (`claude/repository-overview-gnsdx3`,
-tracked via PR #1) triggers an automatic rebuild and redeploy.
+Every push to the connected branch triggers Render to rebuild the Docker
+image from scratch and redeploy it automatically.
 
 ---
 
-## 5. What Upstash actually is, precisely
+## 6. What Upstash actually is, precisely
 
 Upstash provides **serverless Redis**: a managed Redis-protocol-compatible
 database that you connect to exactly like any Redis server (TCP + TLS +
@@ -196,7 +244,79 @@ Concretely, for this deployment:
 
 ---
 
-## 6. Environment variables actually in use
+## 7. The Dockerfile and .dockerignore
+
+### Purpose
+
+The `Dockerfile` (repo root) is the build recipe that turns the Go source in
+`src/` into a runnable container image. The `.dockerignore` alongside it
+tells Docker which files to leave out of that build entirely. Together they
+make the build **reproducible and portable**: the exact same image can be
+built on a developer's laptop, in CI, or by Render, and behaves identically
+every time — independent of whatever Go version, OS, or tools happen to be
+installed on whichever machine runs `docker build`. This is also, concretely,
+**the mechanism Render uses to build and run this deployment** (§5).
+
+### How it works
+
+The Dockerfile uses a **multi-stage build**:
+
+```dockerfile
+FROM golang:1.26 AS builder
+WORKDIR /build
+COPY src/go.mod src/go.sum ./
+RUN go mod download
+COPY src/ ./
+RUN CGO_ENABLED=0 GOOS=linux go build -o /push-service .
+
+FROM alpine:3.20
+RUN apk add --no-cache ca-certificates
+COPY --from=builder /push-service /push-service
+EXPOSE 8080
+ENTRYPOINT ["/push-service"]
+```
+
+- **Stage 1 (`builder`):** starts from the official `golang:1.26` image
+  (the full Go toolchain), copies just `go.mod`/`go.sum` first so dependency
+  downloads are cached independently of source-code changes, then copies
+  the rest of `src/` and compiles a **statically linked** binary
+  (`CGO_ENABLED=0`) for Linux.
+- **Stage 2 (runtime):** starts fresh from a minimal `alpine` base image —
+  none of the Go toolchain, build cache, or source code from stage 1 carries
+  over. Only the compiled binary and the `ca-certificates` package are
+  copied in — `ca-certificates` is required because the app makes outbound
+  TLS calls to both FCM and Upstash Redis, and needs a trusted root
+  certificate bundle to validate those connections. The result is a small
+  image with nothing in it beyond what's needed to run — no compiler, no
+  source, no package-manager cache.
+- **`.dockerignore`** excludes `.git`, `docs`, `tests`, markdown files, and
+  — importantly — `.env`/`service-account.json` from ever being sent to the
+  Docker build context, so a secret sitting in a local `.env` file can never
+  accidentally end up baked into an image layer.
+
+### Do we need it in production?
+
+**Not for the recommended EC2 + systemd production path** (see
+[production-deployment-explained.md](./production-deployment-explained.md)):
+there, the binary is cross-compiled directly (`GOOS=linux GOARCH=amd64
+CGO_ENABLED=0 go build`) and copied straight onto the EC2 instance, where
+`systemd` runs it directly — no container runtime involved at all.
+
+The Dockerfile still earns its place in the repo, though: it's exactly what
+you'd reach for if the team later chooses a container-orchestrated
+production path instead (ECS/Fargate, Kubernetes, or staying on a paid
+Render plan) — the same, already-validated Dockerfile would carry over
+unchanged. It's also genuinely useful today for local testing without a Go
+toolchain installed at all:
+
+```bash
+docker build -t push-service .
+docker run --rm -p 8080:8080 --env-file src/.env push-service
+```
+
+---
+
+## 8. Environment variables actually in use
 
 | Variable | Value in this deployment | Purpose |
 |---|---|---|
@@ -215,7 +335,7 @@ Concretely, for this deployment:
 
 ---
 
-## 7. Runtime lifecycle — the questions that actually matter
+## 9. Runtime lifecycle — the questions that actually matter
 
 This is the section to have memorized for the meeting.
 
@@ -227,7 +347,7 @@ the public URL — background goroutine activity (like Redis polling) does
 **not** count as activity and does not keep the instance awake.
 
 When a new HTTP request arrives after a spin-down, Render cold-starts a fresh
-container: pulls the built binary, starts the process, runs `main()` again
+container: pulls the built image, starts the process, runs `main()` again
 (which reconnects to Redis, re-creates the OAuth2 HTTP client, re-registers
 the mux) — this takes roughly **30–60 seconds** before the request is
 actually served.
@@ -270,7 +390,7 @@ before a demo.
 
 ---
 
-## 8. Cost breakdown
+## 10. Cost breakdown
 
 ### Render
 
@@ -310,7 +430,7 @@ service.
 
 ---
 
-## 9. Efficiency and limitations summary
+## 11. Efficiency and limitations summary
 
 | Dimension | POC state | Why it's acceptable here | Why it wouldn't be in production |
 |---|---|---|---|
@@ -325,19 +445,19 @@ service.
 
 ---
 
-## 10. Testing & validation tutorial
+## 12. Testing & validation tutorial
 
 Every command below assumes `<url>` is the Render-assigned public URL
 (`https://<service-name>.onrender.com`).
 
-### 10.1 Wake the service and confirm liveness
+### 12.1 Wake the service and confirm liveness
 
 ```bash
 curl -fsS <url>/healthz
 # 200 OK with no body = process is up
 ```
 
-### 10.2 Confirm Redis connectivity
+### 12.2 Confirm Redis connectivity
 
 ```bash
 curl -fsS <url>/readyz
@@ -345,7 +465,7 @@ curl -fsS <url>/readyz
 # 503 = Redis unreachable — check REDIS_ADDR/PASSWORD/TLS env vars first
 ```
 
-### 10.3 Send a direct HTTP push
+### 12.3 Send a direct HTTP push
 
 ```bash
 curl -X POST <url>/notify \
@@ -356,7 +476,7 @@ Expect a `200` with a JSON body listing per-token `success`/`retryable`/
 `latencyMs`. Check the Render **Logs** tab for the matching `[AUDIT]` and
 `[BATCH]` lines.
 
-### 10.4 Exercise the Redis 1:1 delivery path
+### 12.4 Exercise the Redis 1:1 delivery path
 
 From the Upstash console's **CLI** tab, or any local `redis-cli` built with
 TLS support, pointed at the Upstash database:
@@ -375,7 +495,7 @@ the `XADD` itself does not wake it. Check the Render logs for:
 [REDIS] id=... token=... success=true latencyMs=...
 ```
 
-### 10.5 Prove the retry behavior (temporary vs permanent failure)
+### 12.5 Prove the retry behavior (temporary vs permanent failure)
 
 To see a **permanent** failure get acknowledged and dropped, publish an entry
 with an obviously malformed token (e.g. `"deviceTokens":["not-a-real-token"]`)
@@ -390,7 +510,7 @@ loop pick the same entry back up on the next `XAUTOCLAIM` tick if the FCM
 call fails transiently — logs will show the same message ID processed more
 than once.
 
-### 10.6 Inspect stream/consumer-group state directly
+### 12.6 Inspect stream/consumer-group state directly
 
 ```bash
 redis-cli -u rediss://default:<password>@<upstash-endpoint>:6379 XLEN notification_requests
@@ -405,7 +525,7 @@ command.
 
 ---
 
-## 11. Troubleshooting case studies from this deployment
+## 13. Troubleshooting case study from this deployment
 
 ### "too many colons in address"
 
@@ -428,19 +548,9 @@ for convenience with tools that *do* accept full URLs (like plain
 `redis-cli -u ...`). Any future re-deploy or teammate doing this setup should
 expect the same trap.
 
-### Render defaulted to the Go native runtime instead of Docker
-
-**Cause:** the repo was connected to Render *before* PR #1 (containing
-`Dockerfile`/`.dockerignore`) was merged — Render scans the repository once
-at connection time to decide the runtime, and picked "Go" because that's
-what it saw then. The Dockerfile isn't wrong; Render simply never
-re-evaluated its choice after the file appeared. Re-linking the repository
-(or switching the Language/Runtime dropdown, where available) would let
-Render pick up the Dockerfile if the Docker route is wanted later.
-
 ---
 
-## 12. Anticipated questions — quick answers
+## 14. Anticipated questions — quick answers
 
 - **"Is this what we'll ship to real users?"** No — this specific setup
   trades availability for cost. It proves the code path works publicly; it
@@ -460,3 +570,7 @@ Render pick up the Dockerfile if the Docker route is wanted later.
   free-tier security posture, but production should still isolate Redis
   in a private network rather than expose it over the public internet as
   we do here.
+- **"Do we need Docker in production too?"** Not for the recommended
+  production path (EC2 + systemd runs the binary directly) — see §7. The
+  Dockerfile stays useful as a fallback if a containerized production path
+  is chosen instead.
