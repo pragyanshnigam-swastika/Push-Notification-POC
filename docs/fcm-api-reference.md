@@ -74,11 +74,12 @@ tokens than an API's capacity" for each layer.
 ### Layer 1 — this app's own `/notify` request body
 
 The `deviceTokens` array in `NotificationRequest` (`worker-pool.go`) is
-**this app's own invention — Google never sees it as an array.** There is
-currently **no maximum enforced in code** on how many tokens one `/notify`
-call can contain; the only validation is "at least one token, none blank"
-(`validNotificationRequest`). This array never gets sent to Google as a
-unit at all — see Layer 2.
+**this app's own invention — Google never sees it as an array.** The code
+caps it at `maxDeviceTokensPerRequest` (1,000), rejecting larger requests
+with a 400 — not because Google requires it (see Layer 2), but to protect
+this service's own memory/goroutine budget from an oversized or malformed
+request. This array never gets sent to Google as a unit at all regardless
+of size — see Layer 2.
 
 ### Layer 2 — what FCM's v1 `messages:send` API actually accepts
 
@@ -125,39 +126,45 @@ higher number would break anything on Google's side.
 Unlike `messages:send`, the topic subscribe/unsubscribe endpoints
 (`iid.googleapis.com/iid/v1:batchAdd`/`batchRemove`) **do** accept a real
 array (`registration_tokens`) in a single HTTP call — and Google **does**
-cap it, at **1,000 app instances per request** (§6). This is the one spot
+cap it, at **1,000 app instances per request** (§6). This was the one spot
 in this app where "sending more tokens than the API's receiving capacity"
-is a literal, structural risk today: `topicSubscribeHandler()` /
-`topicUnsubscribeHandler()` currently forward the caller's array to Google
-**unchecked**. A request with more than 1,000 tokens gets its single
-`batchAdd`/`batchRemove` call rejected outright — there's no documented
-partial-success behavior to lean on, so the correct handling is to never
-send a request that large in the first place.
+was a literal, structural risk: `topicSubscribeHandler()` /
+`topicUnsubscribeHandler()` used to forward the caller's array to Google
+unchecked, and a request over 1,000 tokens would have had its single
+`batchAdd`/`batchRemove` call rejected outright with no partial-success
+behavior to lean on. **This is now fixed:** both handlers call
+`sendTopicBatches()`, which splits the token array into ≤1,000-token
+chunks via `chunkTokens()` and issues one `batchAdd`/`batchRemove` call per
+chunk, so a request that large now succeeds in multiple Google-side calls
+instead of failing in one. The response shape changed as a result —
+see §6 below.
 
 ### Direct answers
 
 - **"How many tokens can `/notify`'s array hold, and how many are processed
-  at once?"** No Google-imposed maximum on the array; internally, up to 50
-  are ever in flight to FCM simultaneously (Layer 3), with the rest queued
-  and processed as workers free up — a 10,000-token request still
-  completes, just serialized through 50-at-a-time concurrency rather than
-  rejected or truncated.
+  at once?"** Up to `maxDeviceTokensPerRequest` (1,000) per request — a
+  self-imposed ceiling, not a Google one — of which up to 50 are ever in
+  flight to FCM simultaneously (Layer 3), with the rest queued and
+  processed as workers free up. A 1,000-token request still completes in
+  one call; anything larger is rejected up front with a 400 rather than
+  accepted and left to strain the worker pool.
 - **"How do I handle sending more tokens than an API's capacity?"** Depends
   which capacity:
   - *FCM send itself has no batch capacity to exceed* — there's nothing to
     chunk, because every send was already exactly one token to begin with.
-    The one thing worth adding is a **sane upper bound on `/notify`'s
-    incoming array size** (e.g., reject over ~1,000–5,000 tokens with a
-    400) — not because Google requires it, but to protect this service's
-    own memory/goroutine budget from an oversized or malformed request.
-  - *The topic batch endpoints have a real 1,000-token cap that this app
-    currently ignores* — this **is** a fix worth making: split the
-    caller's array into ≤1,000-token chunks, issue one `batchAdd`/
-    `batchRemove` call per chunk, and aggregate the results.
+    `/notify` now enforces a **sane upper bound on the incoming array size**
+    (1,000 tokens, 400 if exceeded) — not because Google requires it, but
+    to protect this service's own memory/goroutine budget from an oversized
+    or malformed request.
+  - *The topic batch endpoints have a real 1,000-token cap* — `sendTopicBatches()`
+    now splits the caller's array into ≤1,000-token chunks, issues one
+    `batchAdd`/`batchRemove` call per chunk, and returns each chunk's
+    outcome so a partial failure among several chunks is visible rather
+    than silently lost.
   - *Sustained volume approaching the 600K/minute project quota* is the
     true "exceeded processing capacity" scenario, and Google's answer is
-    exponential backoff with jitter, honoring `Retry-After` (§4) — already
-    flagged as this app's top gap in §11.
+    exponential backoff with jitter, honoring `Retry-After` (§4) — still
+    this app's top open gap, tracked in §11.
 
 ### Related questions worth having answers to
 
@@ -256,10 +263,16 @@ because the code recognizes the error explicitly).
 | Topic name character rules | Must match `[a-zA-Z0-9-_.~%]+` (letters, numbers, and `-`, `_`, `.`, `~`, `%`) | [Manage topics from the server](https://firebase.google.com/docs/cloud-messaging/manage-topics) |
 
 **Against this app's code:** `topicSubscribeHandler()` /
-`topicUnsubscribeHandler()` forward whatever `deviceTokens` array the
-caller supplies straight into a single `batchAdd`/`batchRemove` call, with
-**no check against the 1,000-token-per-call limit** — see §3 for the full
-treatment of this gap and the recommended chunking fix.
+`topicUnsubscribeHandler()` now split whatever `deviceTokens` array the
+caller supplies into ≤1,000-token chunks via `sendTopicBatches()`, issuing
+one `batchAdd`/`batchRemove` call per chunk instead of one oversized call
+that Google would reject outright — see §3 for the full treatment. One
+consequence worth knowing: the response shape changed from forwarding
+Google's raw single-call body to `{"tokenCount": N, "batches": [...]}`,
+where each entry in `batches` reports one chunk's `tokenCount`,
+`statusCode`, and decoded `body` (or `error` if the call itself failed) —
+necessary because a request can now involve more than one underlying call
+to Google, so there's no longer a single flat response to forward as-is.
 
 ### Topic message send limits
 
@@ -384,7 +397,9 @@ exists for anyone, not just this app.
 
 A consolidated, actionable list — everything above that represents a real
 gap between what Google recommends and what the code currently does,
-ordered by how much it matters before scaling up traffic:
+ordered by how much it matters before scaling up traffic.
+
+### Open
 
 1. **No `Retry-After` handling or exponential backoff on FCM retries**
    (§4). The single highest-priority fix — Google explicitly warns of
@@ -397,20 +412,30 @@ ordered by how much it matters before scaling up traffic:
 3. **No client-side payload size validation** on `topicNotifyHandler`'s
    free-form `data` field (§2) — a large payload fails only after a round
    trip to FCM, with no earlier warning.
-4. **No batching/chunking of `deviceTokens` against the 1,000-per-call IID
-   limit** (§3, §6) on the topic subscribe/unsubscribe endpoints — this one
-   *is* a real, documented cap that the current code can exceed and fail
-   against, unlike #2 above.
-5. **No token staleness tracking** (§7) — acceptable given this service has
+3. **No token staleness tracking** (§7) — acceptable given this service has
    no persistent store, but worth explicitly assigning to whichever
    upstream service owns device tokens.
-6. **Topic management rides on the Instance ID API rather than an official
+4. **Topic management rides on the Instance ID API rather than an official
    Admin SDK** (§6) — not broken, but worth revisiting if/when an Admin SDK
    is adopted for other reasons.
 
-None of these are hosting-platform-specific — they apply identically
-whether the service runs on Render+Upstash (the current POC) or EC2+
-ElastiCache (the recommended production path), and fixing them is
+### Fixed
+
+- **`/notify`'s incoming `deviceTokens` array had no upper bound** (§3) —
+  not a Google-imposed requirement, but a self-inflicted resource-exhaustion
+  risk, since nothing stopped a caller from submitting an arbitrarily large
+  array and consuming this service's own memory and goroutines. Now capped
+  at `maxDeviceTokensPerRequest` (1,000), rejected with a 400 above that.
+- **`deviceTokens` wasn't chunked against the 1,000-per-call IID limit**
+  (§3, §6) on the topic subscribe/unsubscribe endpoints — this one *was* a
+  real, documented cap the code could exceed and fail against outright,
+  unlike the self-imposed one above. `sendTopicBatches()` now splits any
+  request into ≤1,000-token chunks and issues one `batchAdd`/`batchRemove`
+  call per chunk.
+
+None of the open items are hosting-platform-specific — they apply
+identically whether the service runs on Render+Upstash (the current POC) or
+EC2+ElastiCache (the recommended production path), and fixing them is
 independent of and complementary to the production infrastructure work in
 [production-deployment-explained.md](./production-deployment-explained.md).
 
