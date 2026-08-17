@@ -9,6 +9,20 @@ import (
 	"net/http"
 )
 
+const (
+	iidBatchAddURL    = "https://iid.googleapis.com/iid/v1:batchAdd"
+	iidBatchRemoveURL = "https://iid.googleapis.com/iid/v1:batchRemove"
+
+	// iidMaxTokensPerBatch is a hard limit Google enforces on the Instance
+	// ID batchAdd/batchRemove endpoints: a single call with more
+	// registration tokens than this is rejected outright. Unlike
+	// maxDeviceTokensPerRequest in worker-pool.go, this number isn't a
+	// choice — it must match Google's actual cap (see
+	// docs/fcm-api-reference.md §3/§6), so requests larger than this are
+	// split into multiple batchAdd/batchRemove calls below.
+	iidMaxTokensPerBatch = 1000
+)
+
 // TopicSubscribeRequest — payload for subscribing tokens to a topic.
 type TopicSubscribeRequest struct {
 	Topic        string   `json:"topic"`
@@ -29,6 +43,93 @@ type TopicUnsubscribeRequest struct {
 	DeviceTokens []string `json:"deviceTokens"`
 }
 
+// batchChunkResult is one chunk's outcome against the Instance ID API.
+// Reporting per-chunk instead of merging everything into one blob means a
+// caller who sent more than iidMaxTokensPerBatch tokens can see exactly
+// which chunk (if any) failed, rather than losing that detail.
+type batchChunkResult struct {
+	TokenCount int                    `json:"tokenCount"`
+	StatusCode int                    `json:"statusCode,omitempty"`
+	Body       map[string]interface{} `json:"body,omitempty"`
+	Error      string                 `json:"error,omitempty"`
+}
+
+// chunkTokens splits tokens into groups of at most size, preserving order.
+func chunkTokens(tokens []string, size int) [][]string {
+	if len(tokens) == 0 {
+		return nil
+	}
+	chunks := make([][]string, 0, (len(tokens)+size-1)/size)
+	for start := 0; start < len(tokens); start += size {
+		end := start + size
+		if end > len(tokens) {
+			end = len(tokens)
+		}
+		chunks = append(chunks, tokens[start:end])
+	}
+	return chunks
+}
+
+// sendTopicBatches calls the given Instance ID batch endpoint (batchAdd or
+// batchRemove) once per chunk of at most iidMaxTokensPerBatch tokens,
+// since Google rejects a single call above that limit outright rather than
+// partially processing it. Shared by topicSubscribeHandler and
+// topicUnsubscribeHandler — batchAdd/batchRemove differ only in URL.
+func sendTopicBatches(url, topic string, tokens []string) []batchChunkResult {
+	chunks := chunkTokens(tokens, iidMaxTokensPerBatch)
+	results := make([]batchChunkResult, 0, len(chunks))
+
+	for _, chunk := range chunks {
+		requestBody := map[string]interface{}{
+			"to":                  "/topics/" + topic,
+			"registration_tokens": chunk,
+		}
+		payload, err := json.Marshal(requestBody)
+		if err != nil {
+			results = append(results, batchChunkResult{TokenCount: len(chunk), Error: err.Error()})
+			continue
+		}
+
+		httpReq, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(payload))
+		if err != nil {
+			results = append(results, batchChunkResult{TokenCount: len(chunk), Error: err.Error()})
+			continue
+		}
+		httpReq.Header.Set("Content-Type", "application/json")
+		httpReq.Header.Set("access_token_auth", "true") // required — tells this endpoint the Bearer token is OAuth2, not a legacy server key
+
+		resp, err := httpClient.Do(httpReq) // same authenticated client — Bearer token attached automatically
+		if err != nil {
+			results = append(results, batchChunkResult{TokenCount: len(chunk), Error: err.Error()})
+			continue
+		}
+
+		responseBody, err := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if err != nil {
+			results = append(results, batchChunkResult{TokenCount: len(chunk), StatusCode: resp.StatusCode, Error: err.Error()})
+			continue
+		}
+
+		var prettyJSON bytes.Buffer
+		if jsonErr := json.Indent(&prettyJSON, responseBody, "", "  "); jsonErr == nil {
+			log.Printf("Topic batch response [%s] tokens=%d:\n%s", resp.Status, len(chunk), prettyJSON.String())
+		} else {
+			log.Printf("[Error] Topic batch response [%s] tokens=%d: %s", resp.Status, len(chunk), responseBody)
+		}
+
+		var body map[string]interface{}
+		_ = json.Unmarshal(responseBody, &body) // best-effort; a non-JSON body still reports via StatusCode
+		results = append(results, batchChunkResult{TokenCount: len(chunk), StatusCode: resp.StatusCode, Body: body})
+	}
+
+	return results
+}
+
+// topicSubscribeHandler responds with {"tokenCount", "batches"} rather than
+// forwarding Google's raw response — with chunking, a single request can
+// now produce more than one underlying batchAdd call, so there's no longer
+// one flat response to forward as-is.
 func topicSubscribeHandler(w http.ResponseWriter, r *http.Request) {
 	var req TopicSubscribeRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -40,60 +141,13 @@ func topicSubscribeHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	requestBody := map[string]interface{}{
-		"to":                  "/topics/" + req.Topic,
-		"registration_tokens": req.DeviceTokens,
-	}
-	payload, err := json.Marshal(requestBody)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-
-	httpReq, err := http.NewRequest(http.MethodPost, "https://iid.googleapis.com/iid/v1:batchAdd", bytes.NewReader(payload))
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-	httpReq.Header.Set("Content-Type", "application/json")
-	httpReq.Header.Set("access_token_auth", "true") // required — tells this endpoint the Bearer token is OAuth2, not a legacy server key
-
-	resp, err := httpClient.Do(httpReq) // same authenticated client — Bearer token attached automatically
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadGateway)
-		return
-	}
-	defer resp.Body.Close()
-
-	// Read the response body.
-	responseBody, err := io.ReadAll(resp.Body)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadGateway)
-		return
-	}
-
-	// Pretty-print JSON in the terminal.
-	var prettyJSON bytes.Buffer
-	if err := json.Indent(&prettyJSON, responseBody, "", "  "); err == nil {
-		log.Printf("Topic subscription response [%s]:\n%s \n%s",
-			resp.Status,
-			prettyJSON.String(),
-			responseBody,
-		)
-	} else {
-		// Response wasn't valid JSON.
-		log.Printf("[Error] Topic subscription response [%s]: %s",
-			resp.Status,
-			responseBody,
-		)
-	}
-
-	var result map[string]interface{}
-	// json.NewDecoder(resp.Body).Decode(&result)
-	json.NewDecoder(bytes.NewReader(responseBody)).Decode(&result)
+	batches := sendTopicBatches(iidBatchAddURL, req.Topic, req.DeviceTokens)
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(result)
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"tokenCount": len(req.DeviceTokens),
+		"batches":    batches,
+	})
 }
 
 func topicNotifyHandler(w http.ResponseWriter, r *http.Request) {
@@ -135,6 +189,8 @@ func topicNotifyHandler(w http.ResponseWriter, r *http.Request) {
 	w.Write(body)
 }
 
+// topicUnsubscribeHandler mirrors topicSubscribeHandler — same chunking
+// logic and response shape, batchRemove being the only difference.
 func topicUnsubscribeHandler(w http.ResponseWriter, r *http.Request) {
 	var req TopicUnsubscribeRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -146,30 +202,11 @@ func topicUnsubscribeHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	body := map[string]interface{}{
-		"to":                  "/topics/" + req.Topic,
-		"registration_tokens": req.DeviceTokens,
-	}
-	payload, _ := json.Marshal(body)
-
-	httpReq, err := http.NewRequest(http.MethodPost, "https://iid.googleapis.com/iid/v1:batchRemove", bytes.NewReader(payload))
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-	httpReq.Header.Set("Content-Type", "application/json")
-	httpReq.Header.Set("access_token_auth", "true")
-
-	resp, err := httpClient.Do(httpReq)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadGateway)
-		return
-	}
-	defer resp.Body.Close()
-
-	var result map[string]interface{}
-	json.NewDecoder(resp.Body).Decode(&result)
+	batches := sendTopicBatches(iidBatchRemoveURL, req.Topic, req.DeviceTokens)
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(result)
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"tokenCount": len(req.DeviceTokens),
+		"batches":    batches,
+	})
 }

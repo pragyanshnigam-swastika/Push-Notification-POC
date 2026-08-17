@@ -20,6 +20,16 @@ type NotificationRequest struct {
 	Message      string   `json:"message"`
 }
 
+// maxDeviceTokensPerRequest is a self-imposed ceiling, not an FCM limit.
+// FCM's v1 messages:send API has no batch/array field at all — every token
+// already becomes its own individual call via sendToManyPooled, so a huge
+// deviceTokens array can't overflow anything on Google's side. It can,
+// however, overflow this process's own memory and goroutine budget, since
+// sendToManyPooled allocates one result slot and one queued job per token
+// regardless of how many run concurrently. This cap exists solely to
+// protect this service from an oversized or malformed request.
+const maxDeviceTokensPerRequest = 1000
+
 // SendResult captures the outcome for one device, including whether a
 // failure was retryable — this is new, and it's what lets a caller (or a
 // future retry layer) know whether trying again is even worth it.
@@ -48,6 +58,11 @@ func notifyHandler(w http.ResponseWriter, r *http.Request) {
 
 	if len(req.DeviceTokens) == 0 {
 		http.Error(w, "deviceTokens must contain at least one token", http.StatusBadRequest)
+		return
+	}
+
+	if len(req.DeviceTokens) > maxDeviceTokensPerRequest {
+		http.Error(w, fmt.Sprintf("deviceTokens must contain at most %d tokens; split into multiple requests", maxDeviceTokensPerRequest), http.StatusBadRequest)
 		return
 	}
 
