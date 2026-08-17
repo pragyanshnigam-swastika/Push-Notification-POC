@@ -63,6 +63,7 @@ strict 1:1 workflow, publish exactly one device token in each entry.
 - [Free POC deployment (Render + Upstash)](docs/free-poc-deployment.md) — no credit card, no AWS account.
 - [POC deployment deep dive](docs/poc-deployment-explained.md) — architecture, purpose of every component, runtime lifecycle, cost, and testing for the live Render + Upstash deployment.
 - [Production deployment guide](docs/production-deployment-explained.md) — recommended EC2 + systemd + ElastiCache architecture, purpose of every component, the full build-out walkthrough, cost, security, and migration checklist.
+- [FCM & Google API reference](docs/fcm-api-reference.md) — exact payload/quota/rate limits, error codes, and performance figures for every Google API this service calls, sourced and linked for verification.
 
 ## API Endpoints
 
