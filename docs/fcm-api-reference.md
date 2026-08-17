@@ -28,9 +28,9 @@ the meeting is a good five minutes spent.
 
 **The one fact worth leading with:** this app already uses the *current*,
 supported FCM API (HTTP v1) and OAuth2 authentication throughout — it never
-touches the legacy FCM HTTP/XMPP API that Google shut down in 2024 (§9), and
-it never uses a static server key. That's the single biggest FCM-related
-compliance risk, and it's already handled correctly.
+touches the legacy FCM HTTP/XMPP API that Google shut down in 2024 (§10),
+and it never uses a static server key. That's the single biggest
+FCM-related compliance risk, and it's already handled correctly.
 
 ---
 
@@ -45,20 +45,144 @@ compliance risk, and it's already handled correctly.
 | Message TTL — valid range | **0 to 2,419,200 seconds (28 days)** | Same as above |
 | Non-collapsible messages queued per device before drop | **100** — beyond this, FCM discards all stored messages and instead delivers a single "limit reached" signal to the client on reconnect | [Non-collapsible and collapsible messages](https://firebase.google.com/docs/cloud-messaging/customize-messages/collapsible-message-types) |
 | Collapsible messages stored per device | **4** distinct collapse keys simultaneously; a new message with the same key replaces the pending one | Same as above |
+| Message priority options (Android) | **`normal`** — delivered immediately unless the device is in Doze, then delayed to save battery; **`high`** — FCM attempts immediate delivery and will wake a sleeping/Doze device | [Set and manage Android message priority](https://firebase.google.com/docs/cloud-messaging/android-message-priority) |
 
 **Against this app's code:** `sendFCM()` (`worker-pool.go`) sends only a
 `notification{title, body}` block with no `data` payload and no explicit
 `ttl` — so it's always comfortably under the 4096-byte cap, and every
-message gets the default 4-week TTL. `topicNotifyHandler()` does accept an
-arbitrary `data` map from the caller with **no size validation** — a caller
-that stuffs a large object in there could exceed the 4096-byte limit and get
-back `INVALID_ARGUMENT` (§4) with no client-side warning beforehand. Worth
-adding a payload-size check before sending, once this handler sees real
-traffic.
+message gets the default 4-week TTL. Every send path in this app
+(`/notify`, `/notify/topic`, and the Redis consumer) sets
+`android.priority: "high"` unconditionally — the correct choice per
+Google's own guidance for "time-sensitive" delivery (this app's stated
+purpose), at the accepted cost of more battery impact on the receiving
+device. `topicNotifyHandler()` does accept an arbitrary `data` map from the
+caller with **no size validation** — a caller that stuffs a large object in
+there could exceed the 4096-byte limit and get back `INVALID_ARGUMENT`
+(§5) with no client-side warning beforehand. Worth adding a payload-size
+check before sending, once this handler sees real traffic.
 
 ---
 
-## 3. FCM HTTP v1 API — quotas and throttling
+## 3. How many device tokens can actually be sent — capacity, batching, and overflow handling
+
+This gets its own section because "how many tokens can I send, and how many
+are processed at once" actually spans **three distinct layers**, and
+conflating them is the most common way to misjudge this app's real
+capacity. This section also directly answers "what happens if I send more
+tokens than an API's capacity" for each layer.
+
+### Layer 1 — this app's own `/notify` request body
+
+The `deviceTokens` array in `NotificationRequest` (`worker-pool.go`) is
+**this app's own invention — Google never sees it as an array.** There is
+currently **no maximum enforced in code** on how many tokens one `/notify`
+call can contain; the only validation is "at least one token, none blank"
+(`validNotificationRequest`). This array never gets sent to Google as a
+unit at all — see Layer 2.
+
+### Layer 2 — what FCM's v1 `messages:send` API actually accepts
+
+This is the single most important fact in this whole document to have
+memorized: **the FCM HTTP v1 API does not accept an array of tokens.**
+Every `messages:send` request must specify exactly one of `token`, `topic`,
+or `condition` in its `Message` body — there is no batch or multicast field
+at all. Google states this explicitly when discussing the migration from
+the old API: **"there is no v1 equivalent of the 1000 token per request
+(batch send) that was in the legacy API"** — v1 requires **one message per
+token, per HTTP request**, always.
+([Send a message using FCM HTTP v1 API](https://firebase.google.com/docs/cloud-messaging/send/v1-api))
+
+This is a deliberate, permanent design change from the old, now-shut-down
+legacy API, which accepted up to **1,000 tokens** in a single call via a
+`registration_ids` array, with Google fanning the send out server-side.
+That field — and that capability — no longer exists.
+([Migrate from legacy FCM APIs to HTTP v1](https://firebase.google.com/docs/cloud-messaging/migrate-v1))
+
+So: **this app's per-token loop in `sendToManyPooled()` isn't a workaround
+or a missed optimization — it's the only way the v1 API can be used.** Even
+Google's own Admin SDKs work identically under the hood: the "multicast"
+convenience methods (`sendEachForMulticast`, up to **500 tokens per
+invocation**) are purely client-side loops that still issue up to 500
+individual HTTP requests. Google's own guidance for scale is to reuse
+HTTP/2 connections across many single-token requests, not to batch them:
+"the FCM HTTP v1 API supports HTTP/2 so you can send multiple requests
+across a single connection."
+([Send messages to multiple devices](https://firebase.google.com/docs/cloud-messaging/send-message))
+
+### Layer 3 — this app's self-imposed concurrency
+
+`sendToManyPooled(tokens, title, message, 50)` caps concurrent outbound FCM
+requests at `min(50, len(tokens))`. This is **not a Google-imposed limit —
+it's a number this app's own code chose.** Google doesn't publish a "max
+concurrent connections" figure for the v1 API; the real ceiling to watch is
+the project-level quota (§4: 600,000 messages/minute, roughly 10,000/sec
+sustained). At 50 concurrent workers, this app runs nowhere near that
+ceiling even under heavy load — 50 was chosen for restraint, not because a
+higher number would break anything on Google's side.
+
+### The one place a real per-call cap exists: the Instance ID batch endpoints
+
+Unlike `messages:send`, the topic subscribe/unsubscribe endpoints
+(`iid.googleapis.com/iid/v1:batchAdd`/`batchRemove`) **do** accept a real
+array (`registration_tokens`) in a single HTTP call — and Google **does**
+cap it, at **1,000 app instances per request** (§6). This is the one spot
+in this app where "sending more tokens than the API's receiving capacity"
+is a literal, structural risk today: `topicSubscribeHandler()` /
+`topicUnsubscribeHandler()` currently forward the caller's array to Google
+**unchecked**. A request with more than 1,000 tokens gets its single
+`batchAdd`/`batchRemove` call rejected outright — there's no documented
+partial-success behavior to lean on, so the correct handling is to never
+send a request that large in the first place.
+
+### Direct answers
+
+- **"How many tokens can `/notify`'s array hold, and how many are processed
+  at once?"** No Google-imposed maximum on the array; internally, up to 50
+  are ever in flight to FCM simultaneously (Layer 3), with the rest queued
+  and processed as workers free up — a 10,000-token request still
+  completes, just serialized through 50-at-a-time concurrency rather than
+  rejected or truncated.
+- **"How do I handle sending more tokens than an API's capacity?"** Depends
+  which capacity:
+  - *FCM send itself has no batch capacity to exceed* — there's nothing to
+    chunk, because every send was already exactly one token to begin with.
+    The one thing worth adding is a **sane upper bound on `/notify`'s
+    incoming array size** (e.g., reject over ~1,000–5,000 tokens with a
+    400) — not because Google requires it, but to protect this service's
+    own memory/goroutine budget from an oversized or malformed request.
+  - *The topic batch endpoints have a real 1,000-token cap that this app
+    currently ignores* — this **is** a fix worth making: split the
+    caller's array into ≤1,000-token chunks, issue one `batchAdd`/
+    `batchRemove` call per chunk, and aggregate the results.
+  - *Sustained volume approaching the 600K/minute project quota* is the
+    true "exceeded processing capacity" scenario, and Google's answer is
+    exponential backoff with jitter, honoring `Retry-After` (§4) — already
+    flagged as this app's top gap in §11.
+
+### Related questions worth having answers to
+
+- **"Is the 4096-byte limit per field, or for the whole payload?"** The
+  whole payload — `data` + `notification` combined (§2). There's no
+  separate, additional per-key length limit documented beyond that
+  aggregate cap.
+- **"Is there a maximum topic name length?"** Google's docs specify the
+  allowed *character set* (`[a-zA-Z0-9-_.~%]+`, §6) but a maximum length in
+  characters isn't stated in Firebase's public guides. A 900-character
+  limit appears in the Android SDK's own client-side validation source, but
+  that's an implementation detail, not a documented server-side contract —
+  treat topic names as short identifiers rather than relying on a specific
+  character count.
+- **"Could high concurrency itself cause errors, separate from quota?"**
+  Anecdotally yes, for HTTP/2-heavy clients — several developers have
+  reported errors from Admin SDKs opening very large numbers of concurrent
+  streams on one HTTP/2 connection (raised in community bug reports, **not**
+  an official Google-documented limit). This app's 50-worker cap is well
+  below where that's ever been reported as an issue; noted here only as a
+  factor to watch if that number is ever raised significantly.
+
+---
+
+## 4. FCM HTTP v1 API — quotas and throttling
 
 This is the section most likely to come up if someone asks "what happens if
 this suddenly gets popular."
@@ -91,14 +215,14 @@ chosen.
 
 ---
 
-## 4. FCM HTTP v1 API — error codes and retry semantics
+## 5. FCM HTTP v1 API — error codes and retry semantics
 
 | Error code | HTTP status | Meaning (per Google's docs) | Retryable? |
 |---|---|---|---|
 | `INVALID_ARGUMENT` | 400 | Request parameters invalid — invalid registration, invalid package name, message too big, invalid data key, invalid TTL, etc. | No |
 | `UNREGISTERED` | 404 | App instance unregistered from FCM — the token is no longer valid (uninstalled app, expired token, etc.) | No |
 | `SENDER_ID_MISMATCH` | 403 | The credential used doesn't match the sender ID the token was registered under | No |
-| `QUOTA_EXCEEDED` | 429 | Sending rate exceeded the per-project (or per-message-type) quota (§3) | Yes, with backoff |
+| `QUOTA_EXCEEDED` | 429 | Sending rate exceeded the per-project (or per-message-type) quota (§4) | Yes, with backoff |
 | `UNAVAILABLE` | 503 | FCM servers temporarily overloaded or down | Yes, with backoff |
 | `INTERNAL` | 500 | Unknown internal server error | Yes, with backoff |
 | `THIRD_PARTY_AUTH_ERROR` | 401 | APNs certificate or web push auth key invalid/missing — relevant only for iOS/web targets | No (fix credentials first) |
@@ -120,7 +244,7 @@ because the code recognizes the error explicitly).
 
 ---
 
-## 5. Topic messaging and the Instance ID API
+## 6. Topic messaging and the Instance ID API
 
 ### Topic subscription limits
 
@@ -132,13 +256,10 @@ because the code recognizes the error explicitly).
 | Topic name character rules | Must match `[a-zA-Z0-9-_.~%]+` (letters, numbers, and `-`, `_`, `.`, `~`, `%`) | [Manage topics from the server](https://firebase.google.com/docs/cloud-messaging/manage-topics) |
 
 **Against this app's code:** `topicSubscribeHandler()` /
-`topicUnsubscribeHandler()` forward whatever `deviceTokens` array the caller
-supplies straight into a single `batchAdd`/`batchRemove` call, with **no
-check against the 1,000-token-per-call limit**. A caller that sends more
-than 1,000 tokens in one request would get an error back from Google that
-the current code doesn't specifically anticipate or chunk around — worth
-adding client-side batching (split into ≤1,000-token chunks) before this
-endpoint is used for anything beyond small test batches.
+`topicUnsubscribeHandler()` forward whatever `deviceTokens` array the
+caller supplies straight into a single `batchAdd`/`batchRemove` call, with
+**no check against the 1,000-token-per-call limit** — see §3 for the full
+treatment of this gap and the recommended chunking fix.
 
 ### Topic message send limits
 
@@ -182,7 +303,7 @@ knowing:
 
 ---
 
-## 6. Token lifecycle and management
+## 7. Token lifecycle and management
 
 | Fact | Detail | Source |
 |---|---|---|
@@ -195,7 +316,7 @@ knowing:
 anywhere in this codebase** — no last-used timestamp, no proactive pruning
 of stale tokens, no deduplication. The app is entirely reactive: it only
 learns a token is dead when FCM itself returns `UNREGISTERED` on a send
-attempt (§4), at which point the Redis path acknowledges and drops the
+attempt (§5), at which point the Redis path acknowledges and drops the
 message, and the HTTP path just reports `success:false` back to the caller.
 This is a reasonable POC posture — Google's own guidance frames proactive
 token-freshness tracking as an *optimization*, not a requirement — but a
@@ -205,7 +326,7 @@ since this service has no persistent store of its own to do it in.
 
 ---
 
-## 7. Authentication: OAuth2 service-account tokens
+## 8. Authentication: OAuth2 service-account tokens
 
 | Fact | Detail | Source |
 |---|---|---|
@@ -225,7 +346,7 @@ credentials.
 
 ---
 
-## 8. Delivery performance and latency
+## 9. Delivery performance and latency
 
 | Metric | Figure | Source |
 |---|---|---|
@@ -238,21 +359,12 @@ credentials.
 FCM *acknowledges your send request*, not how fast the notification reaches
 the device — that's an important distinction if anyone asks "how fast is
 FCM." Actual device delivery time depends on network conditions, whether
-the device is in Doze mode (§2/§9), and whether the message was sent with
-`normal` or `high` priority.
-
-**Against this app's code:** every send in this codebase — `/notify`,
-`/notify/topic`, and the Redis consumer path — sets
-`android.priority: "high"` unconditionally (`worker-pool.go`, `pubsub.go`).
-Per Google's own guidance, high priority is the correct choice for
-"time-sensitive" notifications (this app's own stated purpose) since it's
-the only priority level FCM will use to wake a device out of Doze mode
-(§2). The trade-off — more battery impact on the receiving device — is an
-accepted cost for this app's use case, not an oversight.
+the device is in Doze mode, and whether the message was sent with `normal`
+or `high` priority (§2).
 
 ---
 
-## 9. Legacy FCM HTTP/XMPP API — deprecation history (context, not action)
+## 10. Legacy FCM HTTP/XMPP API — deprecation history (context, not action)
 
 | Milestone | Date | Source |
 |---|---|---|
@@ -262,29 +374,38 @@ accepted cost for this app's use case, not an oversight.
 
 This app was built directly on the v1 API and OAuth2 from the start — this
 section exists purely as confirmation there is nothing to migrate, and as
-context in case the topic of "why v1 and not the old API" comes up.
+context in case the topic of "why v1 and not the old API" comes up. It's
+also the reason the old batch-send capability discussed in §3 no longer
+exists for anyone, not just this app.
 
 ---
 
-## 10. Gap analysis: this codebase vs. official best practices
+## 11. Gap analysis: this codebase vs. official best practices
 
 A consolidated, actionable list — everything above that represents a real
 gap between what Google recommends and what the code currently does,
 ordered by how much it matters before scaling up traffic:
 
 1. **No `Retry-After` handling or exponential backoff on FCM retries**
-   (§3). The single highest-priority fix — Google explicitly warns of
+   (§4). The single highest-priority fix — Google explicitly warns of
    possible blacklisting for senders who don't back off correctly on 429s.
-2. **No client-side payload size validation** on `topicNotifyHandler`'s
+2. **No upper bound on `/notify`'s incoming `deviceTokens` array size**
+   (§3) — not a Google-imposed requirement, but a self-inflicted
+   resource-exhaustion risk: nothing today stops a caller from submitting
+   an arbitrarily large array and consuming this service's own memory and
+   goroutines.
+3. **No client-side payload size validation** on `topicNotifyHandler`'s
    free-form `data` field (§2) — a large payload fails only after a round
    trip to FCM, with no earlier warning.
-3. **No batching/chunking of `deviceTokens` against the 1,000-per-call IID
-   limit** (§5) on the topic subscribe/unsubscribe endpoints.
-4. **No token staleness tracking** (§6) — acceptable given this service
-   has no persistent store, but worth explicitly assigning to whichever
+4. **No batching/chunking of `deviceTokens` against the 1,000-per-call IID
+   limit** (§3, §6) on the topic subscribe/unsubscribe endpoints — this one
+   *is* a real, documented cap that the current code can exceed and fail
+   against, unlike #2 above.
+5. **No token staleness tracking** (§7) — acceptable given this service has
+   no persistent store, but worth explicitly assigning to whichever
    upstream service owns device tokens.
-5. **Topic management rides on the Instance ID API rather than an official
-   Admin SDK** (§5) — not broken, but worth revisiting if/when an Admin SDK
+6. **Topic management rides on the Instance ID API rather than an official
+   Admin SDK** (§6) — not broken, but worth revisiting if/when an Admin SDK
    is adopted for other reasons.
 
 None of these are hosting-platform-specific — they apply identically
@@ -295,7 +416,7 @@ independent of and complementary to the production infrastructure work in
 
 ---
 
-## 11. Quick-reference numbers
+## 12. Quick-reference numbers
 
 The one table to have open during the meeting:
 
@@ -303,6 +424,10 @@ The one table to have open during the meeting:
 |---|---|
 | Max message payload (Android/Web) | 4096 bytes |
 | Max message payload (iOS via APNs) | 2 KB |
+| Tokens per FCM v1 `messages:send` call | **Exactly 1** — no batch/array field exists |
+| Legacy API's old batch size (removed, historical only) | 1,000 tokens via `registration_ids` |
+| Admin SDK `sendEachForMulticast` batch size (not used by this app) | 500 tokens per invocation |
+| This app's self-imposed concurrent-send limit | 50 workers (`sendToManyPooled`) |
 | Default message TTL | 4 weeks (2,419,200s) |
 | Non-collapsible message queue cap per device | 100 messages |
 | Collapsible message slots per device | 4 collapse keys |
@@ -312,7 +437,7 @@ The one table to have open during the meeting:
 | Recommended retry backoff | Exponential with jitter (1s, 2s, 4s, 8s...) |
 | Default `Retry-After` assumption if header absent | 60 seconds |
 | Max topics per app instance | 2,000 |
-| Max tokens per topic batch call | 1,000 |
+| Max tokens per topic batch call (IID `batchAdd`/`batchRemove`) | 1,000 |
 | Topic subscribe/unsubscribe rate limit | 3,000 QPS/project |
 | Max topics in a condition expression | 5 |
 | Concurrent topic fanouts per project | 1,000 |
@@ -323,13 +448,16 @@ The one table to have open during the meeting:
 
 ---
 
-## 12. Official resource index
+## 13. Official resource index
 
 Every source cited above, deduplicated:
 
 - [About FCM messages](https://firebase.google.com/docs/cloud-messaging/concept-options)
 - [Set the lifespan of a message](https://firebase.google.com/docs/cloud-messaging/customize-messages/setting-message-lifespan)
 - [Non-collapsible and collapsible messages](https://firebase.google.com/docs/cloud-messaging/customize-messages/collapsible-message-types)
+- [Set and manage Android message priority](https://firebase.google.com/docs/cloud-messaging/android-message-priority)
+- [Send a message using FCM HTTP v1 API](https://firebase.google.com/docs/cloud-messaging/send/v1-api)
+- [Send messages to multiple devices](https://firebase.google.com/docs/cloud-messaging/send-message)
 - [Send messages to topics](https://firebase.google.com/docs/cloud-messaging/send-topic-messages)
 - [Topic Messaging](https://firebase.google.com/docs/cloud-messaging/topic-messaging)
 - [Manage topics from the server](https://firebase.google.com/docs/cloud-messaging/manage-topics)
@@ -339,7 +467,6 @@ Every source cited above, deduplicated:
 - [FCM Error Codes reference (enum)](https://firebase.google.com/docs/reference/fcm/rest/v1/ErrorCode)
 - [FCM Error Codes guide](https://firebase.google.com/docs/cloud-messaging/error-codes)
 - [Best practices for FCM registration management](https://firebase.google.com/docs/cloud-messaging/manage-tokens)
-- [Set and manage Android message priority](https://firebase.google.com/docs/cloud-messaging/android-message-priority)
 - [Migrate from legacy FCM APIs to HTTP v1](https://firebase.google.com/docs/cloud-messaging/migrate-v1)
 - [Understanding message delivery](https://firebase.google.com/docs/cloud-messaging/understand-delivery)
 - [Understanding FCM Message Delivery on Android (Firebase engineering blog)](https://firebase.blog/posts/2024/07/understand-fcm-delivery-rates/)
