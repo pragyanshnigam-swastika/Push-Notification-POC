@@ -404,7 +404,12 @@ ordered by how much it matters before scaling up traffic.
 1. **No `Retry-After` handling or exponential backoff on FCM retries**
    (§4). The single highest-priority fix — Google explicitly warns of
    possible blacklisting for senders who don't back off correctly on 429s.
-2. **No client-side payload size validation** on `topicNotifyHandler`'s
+2. **No upper bound on `/notify`'s incoming `deviceTokens` array size**
+   (§3) — not a Google-imposed requirement, but a self-inflicted
+   resource-exhaustion risk: nothing today stops a caller from submitting
+   an arbitrarily large array and consuming this service's own memory and
+   goroutines.
+3. **No client-side payload size validation** on `topicNotifyHandler`'s
    free-form `data` field (§2) — a large payload fails only after a round
    trip to FCM, with no earlier warning.
 3. **No token staleness tracking** (§7) — acceptable given this service has
