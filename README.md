@@ -64,7 +64,7 @@ strict 1:1 workflow, publish exactly one device token in each entry.
 - [POC deployment deep dive](docs/poc-deployment-explained.md) — architecture, purpose of every component, runtime lifecycle, cost, and testing for the live Render + Upstash deployment.
 - [Production deployment guide](docs/production-deployment-explained.md) — recommended EC2 + systemd + ElastiCache architecture, purpose of every component, the full build-out walkthrough, cost, security, and migration checklist.
 - [FCM & Google API reference](docs/fcm-api-reference.md) — exact payload/quota/rate limits, error codes, and performance figures for every Google API this service calls, sourced and linked for verification.
-- [FCM internals & integration Q&A](docs/fcm-internals-qa/) — broadcast vs. direct messaging, retry/failure handling, analytics (dashboard vs. your own database), subscribe-then-send timing, deep linking, and pricing.
+- [FCM internals & integration Q&A](docs/fcm-internals-qa/) — broadcast vs. direct messaging, retry/failure handling, analytics (dashboard vs. your own database), subscribe-then-send timing, deep linking, and pricing. Start with [00-all-figures-cheat-sheet.md](docs/fcm-internals-qa/00-all-figures-cheat-sheet.md) for every number on one page.
 
 ## API Endpoints
 
