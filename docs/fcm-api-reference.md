@@ -7,6 +7,12 @@ in a click. This is meant to be the thing you have open during the
 production-readiness meeting when someone asks "what happens at scale" or
 "is that actually documented."
 
+For deeper questions on internal behavior — broadcast vs. direct
+messaging, retry/failure handling for topic sends, analytics, subscribe-
+then-send timing, deep linking, and pricing — see
+[fcm-internals-qa/](./fcm-internals-qa/), which cross-links back here for
+the raw limits tables rather than repeating them.
+
 **A note on sourcing, in the interest of accuracy:** the figures below were
 gathered from Google/Firebase's official documentation pages (all linked
 inline). This session's sandboxed network could not directly render
