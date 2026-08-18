@@ -195,7 +195,7 @@ func (c *redisConsumer) processMessage(ctx context.Context, message redis.XMessa
 	}
 	for _, token := range request.DeviceTokens {
 		started := time.Now()
-		err, retryable := sendFCM(token, request.Title, request.Message)
+		messageID, err, retryable := sendFCM(token, request.Title, request.Message)
 		if err != nil {
 			// sendFCM currently reports every non-2xx HTTP result as retryable.
 			// For Redis delivery, do not leave known permanent FCM failures in
@@ -207,7 +207,7 @@ func (c *redisConsumer) processMessage(ctx context.Context, message redis.XMessa
 			} // Leave pending; XAUTOCLAIM retries it.
 			continue
 		}
-		log.Printf("[REDIS] id=%s token=%s success=true latencyMs=%d", message.ID, mask(token), time.Since(started).Milliseconds())
+		log.Printf("[REDIS] id=%s token=%s success=true messageId=%s latencyMs=%d", message.ID, mask(token), messageID, time.Since(started).Milliseconds())
 	}
 	c.ack(ctx, message.ID)
 }
