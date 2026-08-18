@@ -10,6 +10,11 @@ Companion to [../fcm-api-reference.md](../fcm-api-reference.md), which
 remains the authoritative limits/quota/error-code table — the files here
 link back to it rather than repeating it wholesale.
 
+**Trouble remembering all the numbers?** [00-all-figures-cheat-sheet.md](./00-all-figures-cheat-sheet.md)
+puts every figure from every file below (plus the core limits from
+`fcm-api-reference.md`) on one page, sourced and linked, so you don't have
+to open eight files to recall one number.
+
 1. [Broadcast vs. direct messaging](./01-broadcast-vs-direct-messaging.md) — which is faster, how each is acknowledged, what FCM discloses about its internals.
 2. [Retry and failure handling for topic/broadcast sends](./02-broadcast-retry-and-failure-handling.md) — what Google handles automatically vs. what you must handle yourself.
 3. [Analytics: dashboard vs. your own database](./03-analytics-dashboard-vs-your-database.md) — every metric Google exposes, and what it will never give you.
