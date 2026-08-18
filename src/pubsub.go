@@ -168,9 +168,19 @@ func topicNotifyHandler(w http.ResponseWriter, r *http.Request) {
 				"title": req.Title,
 				"body":  req.Body,
 			},
+
+			// 1. Android High Priority Config
 			"android": map[string]interface{}{
-				"priority": "high", // requests immediate delivery, bypasses some Doze deferral
+				"priority": "high", // Instructs FCM to wake a sleeping Android device
 			},
+
+			// 2. iOS (APNs) High Priority Config
+			"apns": map[string]interface{}{
+				"headers": map[string]string{
+					"apns-priority": "10", // "10" tells Apple APNs to deliver the message immediately
+				},
+			},
+
 			"data": req.Data,
 		},
 	}
