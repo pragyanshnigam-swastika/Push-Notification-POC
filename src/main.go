@@ -12,7 +12,10 @@ import (
 	"syscall"
 	"time"
 
+	firebase "firebase.google.com/go/v4"
+	"firebase.google.com/go/v4/messaging"
 	"golang.org/x/oauth2/google"
+	"google.golang.org/api/option"
 
 	"github.com/joho/godotenv"
 )
@@ -20,6 +23,11 @@ import (
 var (
 	httpClient *http.Client
 	projectID  string
+	// messagingClient backs the separate /notify/multicast path
+	// (multicast.go), via the Firebase Admin Go SDK — independent of
+	// httpClient, which the hand-rolled REST paths (worker-pool.go,
+	// pubsub.go) use directly.
+	messagingClient *messaging.Client
 )
 
 func main() {
@@ -47,6 +55,20 @@ func main() {
 	// indefinitely and lets the consumer retry a temporary failure promptly.
 	httpClient.Timeout = 5 * time.Second
 
+	// The multicast path (multicast.go) goes through the Firebase Admin
+	// SDK instead of a hand-rolled REST call, so it needs its own client --
+	// built from the same service-account credential, with the project ID
+	// pinned explicitly so it can never target a different project than
+	// the rest of this app's PROJECT_ID-driven REST calls.
+	firebaseApp, err := firebase.NewApp(ctx, &firebase.Config{ProjectID: projectID}, option.WithCredentialsJSON(keyData))
+	if err != nil {
+		log.Fatalf("failed to initialize Firebase app: %v", err)
+	}
+	messagingClient, err = firebaseApp.Messaging(ctx)
+	if err != nil {
+		log.Fatalf("failed to initialize Firebase Messaging client: %v", err)
+	}
+
 	consumer, err := newRedisConsumerFromEnv()
 	if err != nil {
 		log.Fatalf("invalid Redis consumer configuration: %v", err)
@@ -55,6 +77,9 @@ func main() {
 	mux := http.NewServeMux()
 	// Worker pool handler for sending notifications to one or multiple device tokens concurrently
 	mux.HandleFunc("/notify", notifyHandler)
+	// Separate path using the Firebase Admin SDK's multicast helper instead
+	// of this app's own worker pool -- see multicast.go.
+	mux.HandleFunc("/notify/multicast", multicastNotifyHandler)
 	// Pub/Sub handlers for topic subscription, notification and unsubscription
 	mux.HandleFunc("/topics/subscribe", topicSubscribeHandler)
 	mux.HandleFunc("/notify/topic", topicNotifyHandler)

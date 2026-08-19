@@ -4,6 +4,9 @@ dist/
 *.exe
 *.out
 *.test
+# `go build ./...` (no -o) in src/ produces a binary named after the
+# module — this is what that looks like; never intentional to commit.
+src/Push-Delivery-Service
 
 # Local runtime secrets and credentials
 .env
