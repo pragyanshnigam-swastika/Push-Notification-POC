@@ -1,89 +1,146 @@
-# Retry and failure handling for broadcast (topic) messages
+# Retry and failure handling: FCM's side, and what this app implements (1:1 and topics)
 
 ## Bottom line
 
-FCM retries **the delivery attempt to each device** internally according
-to the same documented rules regardless of whether the message came from a
-direct send or a topic fanout. What changes with topics is that **you lose
-all visibility into those per-device outcomes** — there is nothing to
-"explicitly handle" per subscriber, because there's nothing reported to
-handle. What you must still handle explicitly is the *one* outer API call
-itself, exactly like any other FCM request.
+FCM retries **delivery to a device** internally, automatically, for both
+1:1 and topic sends — that part needs no code at all. FCM does **not**
+retry **the API call** if it fails or times out — that has always been the
+caller's job, for both message types. This app now does that job properly:
+a bounded, fast retry on the synchronous HTTP paths, and true exponential
+backoff with a dead-letter safety net on the asynchronous Redis path.
 
-## What Google handles automatically, per device, regardless of origin
+---
 
-These rules apply identically whether a device received the message
-because it was the direct `token` target or because it's subscribed to the
-`topic` that was published to — see
-[fcm-api-reference.md §2](../fcm-api-reference.md#2-fcm-http-v1-api--message-construction-limits)
-for the full table:
+## 1. What FCM does automatically — identical for 1:1 and topics
 
-- **TTL (time-to-live):** default 4 weeks; FCM keeps retrying delivery to
+Once FCM has **accepted** a message (a `200` from `messages:send`), it
+manages delivery to the device(s) itself, using the same rules regardless
+of whether the target was a `token` or a `topic`:
+
+- **TTL (time-to-live):** default 4 weeks — FCM keeps trying to deliver to
   an offline device until the message expires or is superseded.
   ([Set the lifespan of a message](https://firebase.google.com/docs/cloud-messaging/customize-messages/setting-message-lifespan))
-- **Priority:** `high` priority (what this app always sets) gets FCM's most
-  aggressive delivery attempts, including waking a device out of Doze.
+- **Priority:** `high` (what this app always sets, both paths) gets FCM's
+  most aggressive delivery attempts, including waking a device out of
+  Doze.
   ([Set and manage Android message priority](https://firebase.google.com/docs/cloud-messaging/android-message-priority))
-- **Collapsible/non-collapsible behavior:** governs whether a repeated
-  message replaces a pending one or queues separately, capped at 100
-  queued non-collapsible messages per device.
+- **Collapsible/non-collapsible rules:** govern whether a repeated message
+  replaces a pending one, capped at 100 queued non-collapsible messages
+  per device.
   ([Non-collapsible and collapsible messages](https://firebase.google.com/docs/cloud-messaging/customize-messages/collapsible-message-types))
 
-None of this is topic-specific — it's how FCM treats *any* per-device
-delivery attempt. Topics don't get special retry treatment; they just
-multiply how many devices this logic runs against per publish call.
+This is **fully reliable and needs zero code from us** — it's the same
+mechanism either way. Topics don't get special treatment; a topic publish
+just runs this logic against every current subscriber at once instead of
+one device.
 
-## What you must still handle explicitly: the outer call
+**What FCM never does automatically, for either message type:** retry the
+`messages:send` HTTP call itself if it fails outright (429, 5xx, network
+error). That has always been on the caller — and until this change, this
+app only did it properly on one of its three send paths.
 
-The single HTTP call you make to publish to a topic is subject to the exact
-same request-level error/retry rules as a direct send
-([fcm-api-reference.md §4-§5](../fcm-api-reference.md#4-fcm-http-v1-api--quotas-and-throttling)):
+---
 
-- `429 QUOTA_EXCEEDED` → back off, honoring `Retry-After` (default 60s if
-  absent), then retry.
-- `5xx` / `UNAVAILABLE` / `INTERNAL` → retryable with exponential backoff.
-- `400 INVALID_ARGUMENT`, `404 UNREGISTERED` (topic-equivalent doesn't
-  really apply — see below), `403 SENDER_ID_MISMATCH` → permanent, don't
-  retry.
+## 2. What this app implements today
 
-This is one call to classify, not one per subscriber — that's the whole
-point of the asymmetry described in
-[broadcast vs. direct](./01-broadcast-vs-direct-messaging.md).
+### 1:1 — `/notify` (HTTP, synchronous)
 
-## What you cannot handle explicitly: individual dead tokens inside a topic
+`sendToManyPooled` (`worker-pool.go`) now wraps every per-token `sendFCM`
+call in `sendWithBoundedRetry` (`retry.go`):
 
-This is the gap worth understanding before relying on topics operationally.
-If 1 of 10,000 subscribers to a topic has an uninstalled app or a stale
-token:
+- Up to **3 attempts** total (`syncMaxAttempts`).
+- Exponential backoff with jitter between attempts, **capped at 2 seconds**
+  (`syncMaxRetryDelay`) — using FCM's own `Retry-After` header when present
+  and smaller than that cap.
+- Stops immediately, no further attempts, the moment a response is
+  classified non-retryable (e.g. `UNREGISTERED`).
+- The final `SendResult` now reports `attempts` alongside `success` and
+  `retryable`, so a caller can see whether a failure already survived
+  retries or is reporting on the first try.
 
-- FCM does **not** tell the sender which subscriber failed.
-- FCM does **not** return a per-device error the way a direct
-  `UNREGISTERED` response would.
-- The dead token isn't retried forever, but the *sender has no programmatic
-  signal that it happened* — that information only shows up, if at all, in
-  aggregate delivery-outcome analytics after the fact (see
-  [analytics](./03-analytics-dashboard-vs-your-database.md)), not as
-  something your code can branch on per message.
+**Why capped at 2 seconds and not a full backoff:** this is a synchronous
+HTTP handler with a caller waiting on a response. FCM's own guidance
+allows `Retry-After` values of tens of seconds under real throttling —
+honoring that fully here would turn "send a push" into "hang for a
+minute," which is worse for the caller than a fast `retryable: true` they
+can act on themselves. This is a deliberate, documented trade-off, not an
+oversight — see `retry.go`'s comments on `sendWithBoundedRetry`.
 
-This is exactly why Google's [token management best
-practices](https://firebase.google.com/docs/cloud-messaging/manage-tokens)
-(refresh cadence, staleness windows — already covered in
-[fcm-api-reference.md §7](../fcm-api-reference.md#7-token-lifecycle-and-management))
-matter *more*, not less, for topic-based delivery: with direct sends, a
-dead token announces itself via an error response you can act on
-immediately; with topics, dead tokens just quietly reduce your effective
-reach with no per-message signal.
+### 1:M — `/notify/topic` (HTTP, synchronous)
 
-## Practical implication for this app
+Previously, this handler had **no retry and no error classification at
+all** — it proxied FCM's raw response straight through, so a transient
+`503` on a topic publish became the caller's problem verbatim. It now uses
+the exact same `sendWithBoundedRetry` mechanism as `/notify`, via a new
+`sendFCMToTopic` function that shares the same underlying HTTP call and
+classification logic (`doSendFCM`). The response shape changed to match
+`/notify`'s (`success`, `attempts`, `messageId`/`error`+`retryable`)
+instead of forwarding Google's raw body.
 
-If topic-based broadcast is adopted later, the retry/failure model doesn't
-need new code for individual failures — there's nothing to catch, because
-Google never reports it. What *is* worth adding (same requirement as the
-direct path, already flagged in
-[fcm-api-reference.md §11](../fcm-api-reference.md#11-gap-analysis-this-codebase-vs-official-best-practices))
-is `Retry-After`-aware exponential backoff on the *publish call itself* —
-that part is identical to the direct-send gap already identified, not a
-new topic-specific one.
+### 1:1 — the Redis consumer path (asynchronous)
+
+This is where genuine, patient exponential backoff belongs, because
+nothing is synchronously waiting on it. `redis-consumer.go`'s `reclaimDue`
+(replacing the old fixed-interval `XAUTOCLAIM` loop) now:
+
+1. Scans pending entries read-only via `XPENDING` (doesn't disturb their
+   idle time or delivery count).
+2. Computes each message's next-eligible-retry time as
+   `base * 2^(deliveries-1)` with jitter, capped at
+   `REDIS_RECLAIM_MAX_SECONDS` — real exponential backoff, not a fixed
+   interval.
+3. **Also honors FCM's `Retry-After` hint directly**: if the last attempt
+   returned one, it's recorded as a short-lived Redis key with that exact
+   TTL, and the message won't be reclaimed while that key still exists —
+   even if the delivery-count backoff alone would have allowed an earlier
+   retry.
+4. Only messages that clear both checks get `XCLAIM`ed and actually
+   retried.
+5. A message that's been delivered `REDIS_MAX_DELIVERY_ATTEMPTS` times
+   (default 5) without succeeding is moved to a `<stream>:dead` stream
+   instead of retried again — visible for operator inspection rather than
+   retrying forever or vanishing silently.
+
+This was verified against a real Redis instance (not just reasoned about):
+confirmed that `XPENDING` doesn't disturb state while `XCLAIM`/`XAUTOCLAIM`
+do, confirmed the backoff correctly delays a retry until its window
+elapses, confirmed a `Retry-After` hint correctly overrides a shorter
+count-based backoff, and confirmed dead-lettering after exhausting
+attempts correctly stops retries and preserves the original payload.
+
+### The one thing that remains true for both, permanently — not a gap, a hard limit
+
+**No per-device visibility into a topic's fanout, ever.** If 1 of 10,000
+topic subscribers has a dead token, FCM does not tell the sender which one
+— there is no error, no callback, nothing to retry differently for that
+specific device. This is not something retry logic can fix, on either
+side — it's a structural property of how topics work, covered in full in
+[broadcast vs. direct messaging](./01-broadcast-vs-direct-messaging.md).
+The retry/backoff work above governs the **one outer publish call**; it
+was never able to, and still can't, reach into a topic's individual
+subscriber outcomes.
+
+---
+
+## 3. Statement for the team
+
+> FCM reliably retries delivering an **accepted** message to a device on
+> its own, for both direct sends and topic broadcasts — that requires no
+> code from us and has never been a gap. What FCM does **not** do is retry
+> the API call if that call itself fails or times out (rate limiting,
+> transient server errors, network issues) — that has always been, and
+> remains, this service's responsibility, identically for 1:1 and 1:M.
+> As of this change, all three send paths (`/notify`, `/notify/topic`, and
+> the Redis-based 1:1 queue) handle that correctly: the two synchronous
+> HTTP paths retry fast and briefly since a caller is waiting; the
+> asynchronous Redis path retries patiently with true exponential backoff,
+> honors FCM's own requested wait time when it gives one, and gives up
+> cleanly into an inspectable dead-letter stream rather than retrying
+> forever. The one thing no amount of our own code can change: once a
+> message is published to a **topic**, we get exactly one acknowledgment
+> for the whole broadcast and no way to know which individual subscribers
+> received it — that's a structural limit of topics, not a retry-handling
+> gap.
 
 ## Sources
 
@@ -93,3 +150,4 @@ new topic-specific one.
 - [FCM Error Codes reference](https://firebase.google.com/docs/reference/fcm/rest/v1/ErrorCode)
 - [Best practices when sending FCM messages at scale](https://firebase.google.com/docs/cloud-messaging/scale-fcm)
 - [Best practices for FCM registration management](https://firebase.google.com/docs/cloud-messaging/manage-tokens)
+- [Topic Messaging](https://firebase.google.com/docs/cloud-messaging/topic-messaging)

@@ -3,10 +3,10 @@ package main
 import (
 	"bytes"
 	"encoding/json"
-	"fmt"
 	"io"
 	"log"
 	"net/http"
+	"time"
 )
 
 const (
@@ -150,23 +150,19 @@ func topicSubscribeHandler(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-func topicNotifyHandler(w http.ResponseWriter, r *http.Request) {
-	var req TopicNotifyRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, "invalid JSON: "+err.Error(), http.StatusBadRequest)
-		return
-	}
-	if req.Topic == "" {
-		http.Error(w, "topic is required", http.StatusBadRequest)
-		return
-	}
-
+// sendFCMToTopic sends a push to every current subscriber of a topic and
+// returns (messageID, error, retryable, retryAfter) — the same shape as
+// sendFCM, sharing its HTTP call and error classification via doSendFCM.
+// A single call here is one publish to the topic, not one call per
+// subscriber — see docs/fcm-internals-qa/01-broadcast-vs-direct-messaging.md
+// for why FCM never reports per-subscriber outcomes back to the sender.
+func sendFCMToTopic(topic, title, body string, data map[string]interface{}) (string, error, bool, time.Duration) {
 	message := map[string]interface{}{
 		"message": map[string]interface{}{
-			"topic": req.Topic, // note: "topic" here, not "token" — this is the only structural difference from your existing sendFCM
+			"topic": topic, // note: "topic" here, not "token" — this is the only structural difference from sendFCM
 			"notification": map[string]string{
-				"title": req.Title,
-				"body":  req.Body,
+				"title": title,
+				"body":  body,
 			},
 
 			// 1. Android High Priority Config
@@ -181,22 +177,53 @@ func topicNotifyHandler(w http.ResponseWriter, r *http.Request) {
 				},
 			},
 
-			"data": req.Data,
+			"data": data,
 		},
 	}
-	payload, _ := json.Marshal(message)
+	return doSendFCM(message)
+}
 
-	url := fmt.Sprintf("https://fcm.googleapis.com/v1/projects/%s/messages:send", projectID)
-	resp, err := httpClient.Post(url, "application/json", bytes.NewReader(payload))
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadGateway)
+// topicNotifyHandler used to proxy FCM's raw response straight through with
+// no retry and no error classification at all — a transient 429/503 on a
+// topic publish just became the caller's problem verbatim. It now retries
+// transient failures the same bounded way /notify does (see retry.go) and
+// reports a result shape consistent with /notify's, including FCM's
+// message ID and how many attempts it took.
+func topicNotifyHandler(w http.ResponseWriter, r *http.Request) {
+	var req TopicNotifyRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "invalid JSON: "+err.Error(), http.StatusBadRequest)
 		return
 	}
-	defer resp.Body.Close()
+	if req.Topic == "" {
+		http.Error(w, "topic is required", http.StatusBadRequest)
+		return
+	}
 
-	w.WriteHeader(resp.StatusCode)
-	body, _ := io.ReadAll(resp.Body)
-	w.Write(body)
+	start := time.Now()
+	messageID, err, retryable, attempts := sendWithBoundedRetry(func() (string, error, bool, time.Duration) {
+		return sendFCMToTopic(req.Topic, req.Title, req.Body, req.Data)
+	}, syncMaxAttempts, syncMaxRetryDelay)
+	elapsed := time.Since(start)
+	success := err == nil
+
+	log.Printf("[AUDIT] topic=%s title=%s success=%v retryable=%v attempts=%d messageId=%s latencyMs=%d",
+		req.Topic, req.Title, success, retryable, attempts, messageID, elapsed.Milliseconds())
+
+	response := map[string]interface{}{
+		"success":   success,
+		"attempts":  attempts,
+		"latencyMs": elapsed.Milliseconds(),
+	}
+	if success {
+		response["messageId"] = messageID
+	} else {
+		response["error"] = err.Error()
+		response["retryable"] = retryable
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(response)
 }
 
 // topicUnsubscribeHandler mirrors topicSubscribeHandler — same chunking

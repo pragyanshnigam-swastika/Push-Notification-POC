@@ -16,7 +16,7 @@ puts every figure from every file below (plus the core limits from
 to open eight files to recall one number.
 
 1. [Broadcast vs. direct messaging](./01-broadcast-vs-direct-messaging.md) — which is faster, how each is acknowledged, what FCM discloses about its internals.
-2. [Retry and failure handling for topic/broadcast sends](./02-broadcast-retry-and-failure-handling.md) — what Google handles automatically vs. what you must handle yourself.
+2. [Retry and failure handling, 1:1 and topics](./02-broadcast-retry-and-failure-handling.md) — what FCM retries automatically vs. what this app implements itself (bounded retry on the synchronous paths, exponential backoff + dead-letter on the Redis path), and the one thing no code can fix (no per-device visibility into a topic's fanout).
 3. [Analytics: dashboard vs. your own database](./03-analytics-dashboard-vs-your-database.md) — every metric Google exposes, and what it will never give you.
 4. [Subscribe-then-send latency](./04-subscribe-then-send-latency.md) — how fast a brand-new topic subscriber can expect to receive a message sent right after subscribing.
 5. [API limits and oversized-payload handling](./05-api-limits-and-payload-handling.md) — condensed headline numbers, linking to the full reference.

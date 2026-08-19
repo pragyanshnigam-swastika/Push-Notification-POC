@@ -213,18 +213,31 @@ this suddenly gets popular."
 | Recommended retry backoff | Exponential: **1s, 2s, 4s, 8s, 16s, 32s...** with random jitter, never fixed-interval retries | Same as above |
 | `Retry-After` handling | **Must be honored** on 429s; if absent, default to **60 seconds** before retrying — Google's own guidance explicitly warns senders may be **blacklisted** for ignoring this and not backing off | Same as above |
 
-**Against this app's code — this is the most important gap to flag:**
-`sendFCM()` does **not** read the `Retry-After` header at all, and neither
-the HTTP `/notify` path nor the Redis consumer path implements exponential
-backoff. The Redis path's retry mechanism (`XAUTOCLAIM` after a fixed
-`REDIS_RECLAIM_AFTER_SECONDS`, default 10s) is a *fixed*-interval retry, not
-the jittered exponential backoff Google's own docs say is required to avoid
-being penalized. At today's POC/demo traffic this is invisible — at real
-production volume, sustained retries during an FCM slowdown could compound
-into exactly the "retry amplification" pattern Google's scaling doc warns
-against. This should be fixed in code before any real ramp-up in traffic —
-independent of which hosting path (Render/Upstash or EC2/ElastiCache) is
-chosen.
+**Against this app's code — this used to be the top gap, now fixed:**
+`sendFCM()`/`doSendFCM()` (`worker-pool.go`) now parse the `Retry-After`
+header on every FCM error response (`parseRetryAfter` in `retry.go`,
+handling both the delta-seconds and HTTP-date forms RFC 9110 allows). Two
+retry strategies now exist, deliberately different, for two different
+situations:
+
+- **Synchronous paths** (`/notify`, `/notify/topic`): a *bounded* retry —
+  up to `syncMaxAttempts` (3) tries total, exponential backoff with jitter
+  capped at `syncMaxRetryDelay` (2s), using FCM's own `Retry-After` when
+  it's smaller than that cap. This is deliberately not a full, patient
+  backoff — blocking an HTTP caller for a Retry-After that can legitimately
+  be tens of seconds would be worse than returning quickly with
+  `retryable: true` and letting the caller decide. See `retry.go`'s
+  `sendWithBoundedRetry` for the reasoning in full.
+- **The Redis consumer path**: true exponential backoff based on each
+  message's actual Redis Streams delivery count (`base * 2^(attempts-1)`,
+  capped at `REDIS_RECLAIM_MAX_SECONDS`, jittered), with FCM's `Retry-After`
+  hint honored as a floor on top of that backoff when present, and a
+  `REDIS_MAX_DELIVERY_ATTEMPTS` cap that moves a message to a
+  `<REDIS_STREAM>:dead` stream instead of retrying forever. This is the
+  patient, long-horizon backoff Google's guidance describes — nothing here
+  is waiting on it synchronously. See
+  [fcm-internals-qa/02-broadcast-retry-and-failure-handling.md](./fcm-internals-qa/02-broadcast-retry-and-failure-handling.md)
+  for the full mechanism.
 
 ---
 
@@ -407,26 +420,26 @@ ordered by how much it matters before scaling up traffic.
 
 ### Open
 
-1. **No `Retry-After` handling or exponential backoff on FCM retries**
-   (§4). The single highest-priority fix — Google explicitly warns of
-   possible blacklisting for senders who don't back off correctly on 429s.
-2. **No upper bound on `/notify`'s incoming `deviceTokens` array size**
-   (§3) — not a Google-imposed requirement, but a self-inflicted
-   resource-exhaustion risk: nothing today stops a caller from submitting
-   an arbitrarily large array and consuming this service's own memory and
-   goroutines.
-3. **No client-side payload size validation** on `topicNotifyHandler`'s
+1. **No client-side payload size validation** on `topicNotifyHandler`'s
    free-form `data` field (§2) — a large payload fails only after a round
    trip to FCM, with no earlier warning.
-3. **No token staleness tracking** (§7) — acceptable given this service has
+2. **No token staleness tracking** (§7) — acceptable given this service has
    no persistent store, but worth explicitly assigning to whichever
    upstream service owns device tokens.
-4. **Topic management rides on the Instance ID API rather than an official
+3. **Topic management rides on the Instance ID API rather than an official
    Admin SDK** (§6) — not broken, but worth revisiting if/when an Admin SDK
    is adopted for other reasons.
 
 ### Fixed
 
+- **No `Retry-After` handling or exponential backoff on FCM retries** (§4)
+  — this was the single highest-priority gap (Google explicitly warns of
+  possible blacklisting for senders who don't back off correctly on 429s).
+  Now fixed with two deliberately different strategies: a short bounded
+  retry for the synchronous `/notify`/`/notify/topic` paths, and true
+  exponential backoff with a dead-letter cap for the asynchronous Redis
+  path — see the updated §4 discussion and
+  [fcm-internals-qa/02-broadcast-retry-and-failure-handling.md](./fcm-internals-qa/02-broadcast-retry-and-failure-handling.md).
 - **`/notify`'s incoming `deviceTokens` array had no upper bound** (§3) —
   not a Google-imposed requirement, but a self-inflicted resource-exhaustion
   risk, since nothing stopped a caller from submitting an arbitrarily large

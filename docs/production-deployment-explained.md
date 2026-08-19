@@ -286,6 +286,8 @@ REDIS_CONSUMER_NAME=
 REDIS_BATCH_SIZE=64
 REDIS_PARALLELISM=64
 REDIS_RECLAIM_AFTER_SECONDS=10
+REDIS_RECLAIM_MAX_SECONDS=300
+REDIS_MAX_DELIVERY_ATTEMPTS=5
 
 # Prefer injecting this value from a secret manager.
 FIREBASE_SERVICE_ACCOUNT_BASE64=replace-with-base64-service-account-json
@@ -293,7 +295,11 @@ FIREBASE_SERVICE_ACCOUNT_BASE64=replace-with-base64-service-account-json
 
 Use `REDIS_TLS=false` only for local Redis or a deliberately non-TLS POC.
 Set `REDIS_RECLAIM_AFTER_SECONDS` above five seconds because FCM calls time
-out after five seconds.
+out after five seconds — this is the *base* delay before a failed message's
+first retry; each subsequent retry backs off exponentially from there, up
+to `REDIS_RECLAIM_MAX_SECONDS`, and a message that still hasn't succeeded
+after `REDIS_MAX_DELIVERY_ATTEMPTS` tries is moved to a
+`<REDIS_STREAM>:dead` stream instead of retried forever.
 
 ### 6.4 systemd unit
 
@@ -548,8 +554,11 @@ redis-cli -h your-redis.internal -p 6379 --tls XINFO CONSUMERS notification_requ
 Expect to see **both** instances' consumer identities listed. Stop the
 `push-service` unit on one instance (`sudo systemctl stop push-service`),
 publish a few entries, and confirm the remaining instance picks up all of
-them — then restart the stopped instance and confirm `XAUTOCLAIM` reassigns
-anything still pending after `REDIS_RECLAIM_AFTER_SECONDS`.
+them — then restart the stopped instance and confirm anything still
+pending gets reclaimed and retried once its exponential backoff window
+elapses (starting at `REDIS_RECLAIM_AFTER_SECONDS` — see
+[fcm-internals-qa/02-broadcast-retry-and-failure-handling.md](./fcm-internals-qa/02-broadcast-retry-and-failure-handling.md)
+for the full retry/backoff/dead-letter mechanism).
 
 ### 12.6 Inspect queue health
 
@@ -605,8 +614,8 @@ by CloudWatch alarms (§9) instead of a manual look.
   `XPENDING` / `XLEN` growth via CloudWatch — that's the direct measure of
   "is the queue draining faster than it fills."
 - **"What happens if one EC2 instance dies?"** With two instances in the
-  consumer group, the other keeps consuming immediately; `XAUTOCLAIM`
-  reclaims whatever the dead instance had in flight after
+  consumer group, the other keeps consuming immediately; whatever the dead
+  instance had in flight gets reclaimed and retried starting after
   `REDIS_RECLAIM_AFTER_SECONDS`. Pair this with EC2 auto-recovery or an ASG
   to replace the dead instance automatically.
 - **"What's the realistic monthly cost?"** ~$26–31/month for Path A without
