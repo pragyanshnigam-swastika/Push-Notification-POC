@@ -68,7 +68,8 @@ strict 1:1 workflow, publish exactly one device token in each entry.
 
 ## API Endpoints
 
-- `POST /notify`
+- `POST /notify` — this service's own worker pool, one `messages:send` call per token (`src/worker-pool.go`).
+- `POST /notify/multicast` — the same 1:many capability via the Firebase Admin SDK's `SendEachForMulticast` instead (`src/multicast.go`) — a separate, independent path; it does not replace or call into `/notify`'s worker pool. Internally FCM still sends one message per token either way (see `docs/fcm-internals-qa/01-broadcast-vs-direct-messaging.md`); this endpoint exists so the SDK's own batching/error-classification helpers are available as an alternative without disturbing the hand-rolled REST path.
 - `POST /topics/subscribe`
 - `POST /notify/topic`
 - `POST /topics/unsubscribe`
@@ -77,4 +78,5 @@ strict 1:1 workflow, publish exactly one device token in each entry.
 
 - `PROJECT_ID` must match the Firebase project used by the service account.
 - The Firebase service account JSON must be supplied in the deployment/runtime environment.
+- `/notify/multicast` requires the same credential as everything else, just loaded through a second client (`firebase.google.com/go/v4`) initialized once at startup alongside the existing OAuth2 `httpClient`.
 - Device tokens and topic registration data are request payload values and must come from clients.
