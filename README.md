@@ -60,6 +60,7 @@ strict 1:1 workflow, publish exactly one device token in each entry.
 
 ## Deployment
 
+- [Technical API documentation](docs/api-documentation.md) — every HTTP endpoint this service exposes and every Google/Firebase API it calls, with request/response/error shapes and an architecture diagram.
 - [Free POC deployment (Render + Upstash)](docs/free-poc-deployment.md) — no credit card, no AWS account.
 - [POC deployment deep dive](docs/poc-deployment-explained.md) — architecture, purpose of every component, runtime lifecycle, cost, and testing for the live Render + Upstash deployment.
 - [Production deployment guide](docs/production-deployment-explained.md) — recommended EC2 + systemd + ElastiCache architecture, purpose of every component, the full build-out walkthrough, cost, security, and migration checklist.
