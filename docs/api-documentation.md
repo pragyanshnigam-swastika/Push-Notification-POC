@@ -8,12 +8,20 @@ full error-code table already live in
 that one instead of repeating it, and stays focused on "what do I send,
 what do I get back, what can go wrong."
 
+§1–§6 describe what's implemented today. §7 covers two items scoped for
+production but intentionally out of the POC — per-delivery-path Redis
+isolation and BigQuery-based reporting — documented now so the effort
+estimate can be sized against a concrete design rather than vague intent.
+
 **On sourcing:** every external API fact below is cited to its official
-Google/Firebase page (§6). Direct fetches to `firebase.google.com` and
-`developers.google.com` are blocked from this environment's network, so
-each was retrieved via search against the official page rather than a
-raw fetch — the linked page remains the source of truth; nothing below is
-sourced from a blog, forum, or AI-generated summary of Google's APIs.
+Google/Firebase page. Direct fetches to `firebase.google.com`,
+`developers.google.com`, and `cloud.google.com`/`docs.cloud.google.com`
+are all blocked from this environment's network, so each was retrieved
+via search against the official page rather than a raw fetch — the
+linked page remains the source of truth; nothing below is sourced from a
+blog, forum, or AI-generated summary of Google's APIs. Where a figure
+couldn't be confirmed precisely this way, it's flagged explicitly rather
+than stated as fact (see §7.2).
 
 ---
 
@@ -42,11 +50,18 @@ flowchart LR
         IID["iid.googleapis.com/iid/v1\n:batchAdd / :batchRemove"]
     end
 
-    Redis[("Redis Stream\nnotification_requests")]
+    Redis1to1[("Redis Stream (live)\nnotification_requests — 1:1")]
+
+    subgraph Planned["Production-scope additions — planned, not built yet (§7)"]
+        direction TB
+        RedisTopic[("Redis Stream\ntopic_notification_requests — 1:M topic")]
+        RedisMulticast[("Redis Stream\nmulticast_notification_requests — 1:M multicast")]
+        BQ[("BigQuery\ndaily reports & analytics")]
+    end
 
     HTTPClient -->|"POST /notify, /notify/multicast,\n/topics/*, /notify/topic"| Main
-    RedisProducer --> Redis
-    Redis <-->|"XREADGROUP / XACK / XAUTOCLAIM"| RC
+    RedisProducer --> Redis1to1
+    Redis1to1 <-->|"XREADGROUP / XACK / XAUTOCLAIM"| RC
 
     Main -.->|mints & auto-refreshes bearer token| OAuth
     WP --> FCM
@@ -54,15 +69,20 @@ flowchart LR
     PS --> FCM
     PS --> IID
     MC -->|"Admin SDK, one HTTP call\nper token under the hood"| FCM
+
+    PS -.->|planned async intake| RedisTopic
+    MC -.->|planned async intake| RedisMulticast
+    WP & MC & PS & RC -.->|planned: per-send audit rows| BQ
 ```
 
-**Reading this diagram:** every arrow into `Google` is an authenticated
-HTTPS call using the one OAuth2 client `main.go` builds at startup (§3.A).
-There is no server-side fan-out anywhere in Google's v1 surface — `/notify`,
-the Redis consumer, and `/notify/multicast` all end up issuing one
-`messages:send`-equivalent call per device token; only the *concurrency
-model* differs between them (a fixed worker pool vs. the Admin SDK's
-internal batching). See
+**Reading this diagram:** solid arrows are what's live today; dashed
+arrows into the `Planned` box are §7, not yet built. Every arrow into
+`Google` is an authenticated HTTPS call using the one OAuth2 client
+`main.go` builds at startup (§4.A). There is no server-side fan-out
+anywhere in Google's v1 surface — `/notify`, the Redis consumer, and
+`/notify/multicast` all end up issuing one `messages:send`-equivalent
+call per device token; only the *concurrency model* differs between them
+(a fixed worker pool vs. the Admin SDK's internal batching). See
 [fcm-internals-qa/01-broadcast-vs-direct-messaging.md](./fcm-internals-qa/01-broadcast-vs-direct-messaging.md)
 for why that's true even for "multicast."
 
@@ -153,7 +173,7 @@ Implemented by `topicNotifyHandler` (`pubsub.go`).
 ```json
 { "topic": "prices", "title": "Market update", "body": "Indices closed up 1.2%", "data": { "symbol": "NIFTY" } }
 ```
-**Response:** forwarded verbatim from FCM — this handler passes through FCM's own status code and body unmodified, so the response is either FCM's success shape or FCM's error shape (§3.B/§4).
+**Response:** forwarded verbatim from FCM — this handler passes through FCM's own status code and body unmodified, so the response is either FCM's success shape or FCM's error shape (§4.B).
 
 **Errors:** `400` (missing `topic`), `502` (the outbound call to FCM failed before any response was received). Any FCM-side error (e.g. malformed `data`, oversized payload) is passed through with FCM's own status code, not translated by this app.
 
@@ -164,7 +184,10 @@ Always `200`, no body, no downstream check — process liveness only.
 `200` if a Redis `PING` succeeds within 1 second; `503` "Redis is unavailable" otherwise. Does **not** check reachability of any Google API — a `readyz` pass does not guarantee FCM is reachable.
 
 ### Redis Stream intake (async, not HTTP)
-Implemented by `redis-consumer.go`. Not a request/response API, but has the same contract shape:
+Implemented by `redis-consumer.go`. Not a request/response API, but has
+the same contract shape. **This exists only for the 1:1 path today** —
+`/notify/topic` and `/notify/multicast` have no queue, and are
+synchronous-only until §7.1 is built.
 
 | | |
 |---|---|
@@ -257,7 +280,96 @@ Full list with examples: [`src/.env.example`](../src/.env.example).
 
 ---
 
-## 7. Official source index
+## 7. Production-scope additions (planned — not yet implemented)
+
+Two items from production planning that are explicitly out of scope for
+the POC, documented here so they can be sized in the estimation task
+against a concrete design rather than a vague intent.
+
+### 7.1 Per-delivery-path Redis isolation
+
+**Current state:** only the 1:1 path has a Redis Stream (§3) —
+`notification_requests` / group `push-delivery`. `/notify/topic` and
+`/notify/multicast` are synchronous HTTP-only: no queue, no
+retry-on-failure beyond what the caller does itself, and a slow or bulky
+send on either path has no isolation from anything else the process is
+doing.
+
+**Planned:** one dedicated Redis Stream + consumer group per delivery
+path. All three still end up calling the same `sendFCM` /
+`sendTopicBatches`-backed send / `sendMulticast` functions that already
+exist today — this is purely an intake/queueing change, not a new FCM
+integration:
+
+| Stream | Consumer group | Feeds | Why isolated |
+|---|---|---|---|
+| `notification_requests` (existing) | `push-delivery` | 1:1 (`sendFCM`) | Time-sensitive; keeps the shortest reclaim delay |
+| `topic_notification_requests` (new) | `push-delivery-topic` | `/notify/topic` | A topic broadcast can be bursty and shouldn't compete with 1:1 for worker/connection budget |
+| `multicast_notification_requests` (new) | `push-delivery-multicast` | `/notify/multicast` | A single multicast request can carry up to 1,000 tokens; isolating it stops one large burst from starving 1:1 or topic delivery |
+
+Each stream keeps its own `REDIS_BATCH_SIZE` / `REDIS_PARALLELISM` /
+`REDIS_RECLAIM_AFTER_SECONDS` tuning — e.g. 1:1 stays aggressive (10s
+reclaim) while bulk paths can run a more relaxed schedule. This is a
+direct extension of the pattern `redis-consumer.go` already implements:
+Redis Streams support multiple independent consumer groups, each with
+its own delivery/ack tracking, specifically to let distinct processing
+workflows share a Redis deployment without interfering with each other.
+([Redis Streams](https://redis.io/docs/latest/develop/use-cases/streaming/))
+
+The existing direct-HTTP endpoints stay as-is for callers that want
+synchronous fire-and-forget; the new streams add the same async,
+retry-capable path 1:1 already has, for both 1:M cases.
+
+### 7.2 BigQuery — daily reports & analytics
+
+**Current state:** every send is logged (`[AUDIT]`, `[MULTICAST AUDIT]`,
+`[BATCH]` lines in `worker-pool.go` / `multicast.go`), but nothing
+aggregates or queries that data — there is no report, dashboard, or
+persisted analytics store anywhere in this codebase today.
+
+**Two official integration patterns**, evaluated against this project's
+planned production host — **AWS EC2 + systemd**
+([production-deployment-explained.md](./production-deployment-explained.md)),
+not GCP compute:
+
+| Approach | How it works | Fits this hosting? |
+|---|---|---|
+| **A. App writes directly to BigQuery** | The Go binary calls the official [`cloud.google.com/go/bigquery`](https://pkg.go.dev/cloud.google.com/go/bigquery) client after every send, reusing the same service-account credential already loaded for FCM (needs the `bigquery.dataEditor` IAM role added). Two write modes: `Inserter.Put` (streaming, real-time, simplest) or a nightly batch `Load` job. | **Yes — hosting-agnostic.** Identical on EC2, Render, or anywhere else; no dependency on GCP-native logging infrastructure. |
+| **B. Cloud Logging → BigQuery sink** | Convert the existing `log.Printf` lines to structured (JSON) log entries, ship them to Cloud Logging, and configure a **sink** that streams matching entries into a BigQuery dataset in small batches, queryable near-real-time. | **No, not without extra work.** This happens automatically only on GCP-hosted compute (Cloud Run, GKE, Compute Engine); on EC2 it needs an explicit log-forwarding agent shipping to Cloud Logging — added infrastructure with no offsetting benefit here. |
+
+**Recommendation: Approach A** — hosting-agnostic, and this app already
+has an authenticated Google client pattern to extend. Within A:
+
+- **Streaming (`Inserter.Put`)** if reports need to reflect sends within
+  minutes. Billed at **$0.01 per 200 MiB** ingested (legacy streaming
+  insert). Google's newer
+  [Storage Write API](https://docs.cloud.google.com/bigquery/docs/write-api),
+  via [`managedwriter`](https://pkg.go.dev/cloud.google.com/go/bigquery/storage/managedwriter),
+  costs **$0.025/GiB/month with the first 2 TiB/month free**, and is what
+  Google now recommends over `Inserter` for new, higher-throughput work.
+- **Nightly batch load** if "daily reports" only need to run once a day —
+  no separate ingestion charge beyond ordinary storage/query cost, at the
+  cost of the data being up to a day stale.
+- Legacy streaming's `insertId` dedup is explicitly best-effort, not a
+  guarantee (Google's own guidance: for high throughput, skip `insertId`
+  and dedup manually instead); only the Storage Write API's non-default
+  stream mode gives an exactly-once guarantee. A duplicate audit row
+  (e.g. from a retried send) only affects a report's counts, not delivery
+  correctness, so this is a design detail to note rather than a blocker.
+
+**One number flagged as unverified rather than guessed:** current
+per-second/per-row streaming-insert quotas returned inconsistent figures
+across repeated searches of Google's quotas page — candidates ranged from
+100 to 1,000,000 rows/sec depending on the source pulled, likely mixing
+in outdated announcements. Confirm directly against
+[BigQuery quotas and limits](https://docs.cloud.google.com/bigquery/quotas)
+before using a specific number to size the estimation task.
+
+Sources: [Streaming data into BigQuery](https://docs.cloud.google.com/bigquery/docs/streaming-data-into-bigquery) · [BigQuery Storage Write API](https://docs.cloud.google.com/bigquery/docs/write-api) · [Cloud Logging → BigQuery export](https://docs.cloud.google.com/logging/docs/export/bigquery) · [Batch loading data](https://docs.cloud.google.com/bigquery/docs/batch-loading-data) · [BigQuery pricing](https://cloud.google.com/bigquery/pricing) · [`cloud.google.com/go/bigquery` reference](https://pkg.go.dev/cloud.google.com/go/bigquery) · [`managedwriter` reference](https://pkg.go.dev/cloud.google.com/go/bigquery/storage/managedwriter)
+
+---
+
+## 8. Official source index
 
 - [Send a message using FCM HTTP v1 API](https://firebase.google.com/docs/cloud-messaging/send/v1-api)
 - [REST Resource: projects.messages](https://firebase.google.com/docs/reference/fcm/rest/v1/projects.messages)
@@ -267,3 +379,12 @@ Full list with examples: [`src/.env.example`](../src/.env.example).
 - [Using OAuth 2.0 for Server to Server Applications](https://developers.google.com/identity/protocols/oauth2/service-account)
 - [Migrate from legacy FCM APIs to HTTP v1](https://firebase.google.com/docs/cloud-messaging/migrate-v1) (confirms `SendEachForMulticast`'s 500-token client-side batching)
 - [`firebase.google.com/go/v4/messaging` package reference](https://pkg.go.dev/firebase.google.com/go/v4/messaging)
+- [Redis Streams](https://redis.io/docs/latest/develop/use-cases/streaming/)
+- [Streaming data into BigQuery](https://docs.cloud.google.com/bigquery/docs/streaming-data-into-bigquery)
+- [BigQuery Storage Write API](https://docs.cloud.google.com/bigquery/docs/write-api)
+- [Cloud Logging → BigQuery export](https://docs.cloud.google.com/logging/docs/export/bigquery)
+- [Batch loading data into BigQuery](https://docs.cloud.google.com/bigquery/docs/batch-loading-data)
+- [BigQuery pricing](https://cloud.google.com/bigquery/pricing)
+- [BigQuery quotas and limits](https://docs.cloud.google.com/bigquery/quotas)
+- [`cloud.google.com/go/bigquery` package reference](https://pkg.go.dev/cloud.google.com/go/bigquery)
+- [`cloud.google.com/go/bigquery/storage/managedwriter` package reference](https://pkg.go.dev/cloud.google.com/go/bigquery/storage/managedwriter)
