@@ -44,8 +44,22 @@ type SendResult struct {
 	MessageID string `json:"messageId,omitempty"`
 	Error     string `json:"error,omitempty"`
 	Retryable bool   `json:"retryable,omitempty"`
-	LatencyMs int64  `json:"latencyMs"`
+	// Attempts is how many times this token was actually sent to FCM,
+	// including the first try — see sendWithBoundedRetry in retry.go. A
+	// value greater than 1 means at least one transient failure was
+	// retried automatically before this result was recorded.
+	Attempts  int   `json:"attempts"`
+	LatencyMs int64 `json:"latencyMs"`
 }
+
+// syncMaxAttempts and syncMaxRetryDelay bound retries made synchronously
+// inside an HTTP handler (/notify, /notify/topic) — see sendWithBoundedRetry
+// in retry.go for why these stay small rather than fully honoring FCM's
+// Retry-After guidance.
+const (
+	syncMaxAttempts   = 3
+	syncMaxRetryDelay = 2 * time.Second
+)
 
 func notifyHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
@@ -93,8 +107,8 @@ func notifyHandler(w http.ResponseWriter, r *http.Request) {
 		}
 		// Per-send audit line — this is the "cheap audit log" from the POC
 		// gap list: not a database, but every send is now traceable.
-		log.Printf("[AUDIT] title=%s message=%s token=%s success=%v retryable=%v messageId=%s latencyMs=%d",
-			req.Title, req.Message, mask(res.DeviceToken), res.Success, res.Retryable, res.MessageID, res.LatencyMs)
+		log.Printf("[AUDIT] title=%s message=%s token=%s success=%v retryable=%v attempts=%d messageId=%s latencyMs=%d",
+			req.Title, req.Message, mask(res.DeviceToken), res.Success, res.Retryable, res.Attempts, res.MessageID, res.LatencyMs)
 	}
 
 	log.Printf("[BATCH] title=%s message=%s total=%d succeeded=%d totalElapsedMs=%d",
@@ -146,10 +160,13 @@ func sendToManyPooled(tokens []string, title, body string, workerCount int) []Se
 			defer wg.Done()
 			for j := range jobs {
 				sendStart := time.Now()
-				// log.Printf("[START] token=%s | sendStart=%v", mask(j.token), sendStart)
-				messageID, err, retryable := sendFCM(j.token, title, body)
+				// Bounded, automatic retry for transient failures (429/5xx)
+				// within this one HTTP request — see retry.go for why this
+				// stays short rather than fully honoring Retry-After here.
+				messageID, err, retryable, attempts := sendWithBoundedRetry(func() (string, error, bool, time.Duration) {
+					return sendFCM(j.token, title, body)
+				}, syncMaxAttempts, syncMaxRetryDelay)
 				elapsed := time.Since(sendStart)
-				// log.Printf("[END] token=%s | elapsed=%v", mask(j.token), elapsed)
 
 				if err != nil {
 					results[j.index] = SendResult{
@@ -157,6 +174,7 @@ func sendToManyPooled(tokens []string, title, body string, workerCount int) []Se
 						Success:     false,
 						Error:       err.Error(),
 						Retryable:   retryable,
+						Attempts:    attempts,
 						LatencyMs:   elapsed.Milliseconds(),
 					}
 				} else {
@@ -164,6 +182,7 @@ func sendToManyPooled(tokens []string, title, body string, workerCount int) []Se
 						DeviceToken: j.token,
 						Success:     true,
 						MessageID:   messageID,
+						Attempts:    attempts,
 						LatencyMs:   elapsed.Milliseconds(),
 					}
 				}
@@ -204,12 +223,15 @@ type fcmSendResponse struct {
 	Name string `json:"name"`
 }
 
-// sendFCM sends the actual push and returns (messageID, error, retryable).
-// messageID is FCM's own "name" field and is only populated on success.
-// retryable=false means: don't bother trying again, the failure is permanent
-// (e.g. the token is dead). retryable=true means a transient issue —
-// worth retrying with backoff in a future iteration.
-func sendFCM(deviceToken, title, body string) (string, error, bool) {
+// sendFCM sends a push to a single device token and returns (messageID,
+// error, retryable, retryAfter). messageID is FCM's own "name" field and is
+// only populated on success. retryable=false means: don't bother trying
+// again, the failure is permanent (e.g. the token is dead). retryable=true
+// means a transient issue — retryAfter carries FCM's own hint for how long
+// to wait before trying again, if it sent one (zero otherwise). The actual
+// HTTP call and response handling is shared with topic sends via
+// doSendFCM (pubsub.go uses the same function for /notify/topic).
+func sendFCM(deviceToken, title, body string) (string, error, bool, time.Duration) {
 	message := map[string]interface{}{
 		"message": map[string]interface{}{
 			"token": deviceToken,
@@ -231,25 +253,31 @@ func sendFCM(deviceToken, title, body string) (string, error, bool) {
 			},
 		},
 	}
+	return doSendFCM(message)
+}
 
+// doSendFCM performs the actual messages:send HTTP call for an
+// already-built message body (a token target for sendFCM, or a topic
+// target for sendFCMToTopic in pubsub.go) and classifies the outcome.
+func doSendFCM(message map[string]interface{}) (string, error, bool, time.Duration) {
 	payload, err := json.Marshal(message)
 	if err != nil {
-		return "", err, false // a marshal error is never going to succeed on retry
+		return "", err, false, 0 // a marshal error is never going to succeed on retry
 	}
-	// log.Printf("Payload for deviceToken [%v] =", mask(deviceToken), payload)
+	// log.Printf("Payload = %s", payload)
 
 	url := fmt.Sprintf("https://fcm.googleapis.com/v1/projects/%s/messages:send", projectID)
 	resp, err := httpClient.Post(url, "application/json", bytes.NewReader(payload))
 	if err != nil {
 		// Network-level failure (timeout, connection refused) — almost
 		// always worth retrying.
-		return "", err, true
+		return "", err, true, 0
 	}
 	defer resp.Body.Close()
 
 	respBody, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return "", err, true
+		return "", err, true, 0
 	}
 
 	// Pretty-print response for debugging.
@@ -266,9 +294,9 @@ func sendFCM(deviceToken, title, body string) (string, error, bool) {
 			// The push still succeeded — a response body FCM didn't format
 			// as expected shouldn't turn a successful send into a reported
 			// failure, it just means no message ID is available this time.
-			return "", nil, false
+			return "", nil, false, 0
 		}
-		return success.Name, nil, false
+		return success.Name, nil, false, 0
 	}
 
 	// Any other status is an FCM error. Classify it through isRetryable()
@@ -282,7 +310,8 @@ func sendFCM(deviceToken, title, body string) (string, error, bool) {
 	_ = json.NewDecoder(bytes.NewReader(respBody)).Decode(&fcmErr) // best-effort; ignore decode failure
 
 	retryable := isRetryable(fcmErr.Error.Status, resp.StatusCode)
-	return "", fmt.Errorf("fcm error (status=%d, code=%s): %s", resp.StatusCode, fcmErr.Error.Status, fcmErr.Error.Message), retryable
+	retryAfter := parseRetryAfter(resp.Header)
+	return "", fmt.Errorf("fcm error (status=%d, code=%s): %s", resp.StatusCode, fcmErr.Error.Status, fcmErr.Error.Message), retryable, retryAfter
 }
 
 // isRetryable classifies FCM's error codes into "try again later" vs

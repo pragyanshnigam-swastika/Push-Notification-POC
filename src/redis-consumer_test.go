@@ -1,7 +1,6 @@
 package main
 
 import (
-	"errors"
 	"testing"
 )
 
@@ -32,20 +31,31 @@ func TestValidRedisNotificationRequestRequiresExactlyOneToken(t *testing.T) {
 	}
 }
 
-func TestIsPermanentFCMError(t *testing.T) {
+// isRetryable is the single, authoritative classification used by both the
+// direct/notify path and the Redis path (see worker-pool.go's doSendFCM) —
+// this used to be duplicated/compensated for by a separate
+// isPermanentFCMError string-match in this file, removed now that
+// isRetryable is reliably reached for every FCM error response.
+func TestIsRetryable(t *testing.T) {
 	tests := []struct {
-		name string
-		err  error
-		want bool
+		name       string
+		fcmStatus  string
+		httpStatus int
+		want       bool
 	}{
-		{"invalid token", errors.New("FCM returned HTTP 400: INVALID_ARGUMENT"), true},
-		{"unregistered token", errors.New("UNREGISTERED"), true},
-		{"temporary FCM outage", errors.New("FCM returned HTTP 503: UNAVAILABLE"), false},
+		{"invalid argument", "INVALID_ARGUMENT", 400, false},
+		{"unregistered token", "UNREGISTERED", 404, false},
+		{"sender id mismatch", "SENDER_ID_MISMATCH", 403, false},
+		{"temporary FCM outage", "UNAVAILABLE", 503, true},
+		{"internal FCM error", "INTERNAL", 500, true},
+		{"quota exceeded", "QUOTA_EXCEEDED", 429, true},
+		{"unknown code, server error status falls back retryable", "", 500, true},
+		{"unknown code, client error status falls back non-retryable", "", 400, false},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			if got := isPermanentFCMError(test.err); got != test.want {
-				t.Fatalf("isPermanentFCMError() = %v, want %v", got, test.want)
+			if got := isRetryable(test.fcmStatus, test.httpStatus); got != test.want {
+				t.Fatalf("isRetryable(%q, %d) = %v, want %v", test.fcmStatus, test.httpStatus, got, test.want)
 			}
 		})
 	}
