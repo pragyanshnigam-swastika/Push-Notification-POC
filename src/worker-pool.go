@@ -43,7 +43,7 @@ type SendResult struct {
 	// correlate a log line against FCM's own Data API, if it's ever needed.
 	MessageID string `json:"messageId,omitempty"`
 	Error     string `json:"error,omitempty"`
-	Retryable bool   `json:"retryable,omitempty"`
+	Retryable bool   `json:"retryable"`
 	LatencyMs int64  `json:"latencyMs"`
 }
 
@@ -227,6 +227,11 @@ func sendFCM(deviceToken, title, body string) (string, error, bool) {
 			"apns": map[string]interface{}{
 				"headers": map[string]string{
 					"apns-priority": "10", // "10" tells Apple APNs to deliver the message immediately
+				},
+				"payload": map[string]interface{}{
+					"aps": map[string]string{
+						"sound": "default",
+					},
 				},
 			},
 		},
