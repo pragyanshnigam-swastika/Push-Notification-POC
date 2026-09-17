@@ -48,7 +48,7 @@ type MulticastResult struct {
 	// one individual message per token under the hood either way.
 	MessageID string `json:"messageId,omitempty"`
 	Error     string `json:"error,omitempty"`
-	Retryable bool   `json:"retryable,omitempty"`
+	Retryable bool   `json:"retryable"`
 }
 
 func multicastNotifyHandler(w http.ResponseWriter, r *http.Request) {
@@ -146,6 +146,15 @@ func sendMulticast(ctx context.Context, tokens []string, title, body string) ([]
 			// there's no per-token breakdown to report in this case, unlike
 			// a per-token failure inside a successfully-returned batch.
 			return nil, fmt.Errorf("SendEachForMulticast: %w", err)
+		}
+
+		fmt.Printf("successCount=%d failureCount=%d\n", batch.SuccessCount, batch.FailureCount)
+		for i, resp := range batch.Responses {
+			if resp.Success {
+				fmt.Printf("  [%d] success messageId=%s\n", i, resp.MessageID)
+			} else {
+				fmt.Printf("  [%d] failed error=%v\n", i, resp.Error)
+			}
 		}
 
 		results = append(results, mapMulticastResults(chunk, batch)...)
